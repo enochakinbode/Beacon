@@ -487,6 +487,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private static let menuBarFontSize: CGFloat = 14
     private static let menuBarBaselineOffset: CGFloat = -2
+    /// Space on each side of the menu-bar text.
+    private static let menuBarHorizontalPadding: CGFloat = 1
 
     /// Update the status-item title with today's internet total (download +
     /// upload, every process, local-network traffic excluded). Driven by the
@@ -504,6 +506,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 .font: NSFont.monospacedDigitSystemFont(ofSize: Self.menuBarFontSize, weight: .regular),
                 .baselineOffset: Self.menuBarBaselineOffset,
             ])
+            // Size the item to the text instead of `variableLength`, whose
+            // built-in side padding is wider than this short label needs.
+            let textWidth = ceil(button.attributedTitle.size().width)
+            statusItem?.length = textWidth + 2 * Self.menuBarHorizontalPadding
         }
         let tip = "Internet today: ↓ \(FormatUtility.formatBytes(today.internetBytesIn))  ↑ \(FormatUtility.formatBytes(today.internetBytesOut))"
         if button.toolTip != tip { button.toolTip = tip }
