@@ -42,6 +42,13 @@ struct AppNetworkUsage: Identifiable, Equatable {
     var internetUploadSpeed: Double = 0
     var internetBytesIn: UInt64 = 0
     var internetBytesOut: UInt64 = 0
+    /// `connections` restricted to internet flows (local flows dropped before
+    /// grouping), for the chart panel's breakdown in Internet scope.
+    var internetConnections: [AppConnection] = []
+
+    func connections(in scope: TrafficScope) -> [AppConnection] {
+        scope == .internet ? internetConnections : connections
+    }
 
     func downloadSpeed(in scope: TrafficScope) -> Double {
         scope == .internet ? internetDownloadSpeed : downloadSpeed

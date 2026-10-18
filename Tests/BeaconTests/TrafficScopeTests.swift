@@ -159,3 +159,57 @@ final class LifetimeUsageInternetDecodingTests: XCTestCase {
         XCTAssertEqual(back.internetBytesOut, 20)
     }
 }
+
+final class SpeedHistoryInternetTests: XCTestCase {
+    /// Buckets persisted before the internet split must still load, with the
+    /// internet series reading as zero.
+    func test_legacyBucket_decodesWithZeroInternet() throws {
+        let json = #"{"start":0,"downSum":30,"upSum":6,"count":3}"#.data(using: .utf8)!
+        let b = try JSONDecoder().decode(SpeedHistoryStore.Bucket.self, from: json)
+        XCTAssertEqual(b.downAvg, 10)
+        XCTAssertEqual(b.netDownAvg, 0)
+        XCTAssertEqual(b.netUpAvg, 0)
+    }
+
+    func test_appendingSample_foldsInternetSums() {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        let a = SpeedHistoryStore.appendingSample([], bucketStart: t0, down: 100, up: 10,
+                                                  netDown: 40, netUp: 4, cap: 10)
+        let b = SpeedHistoryStore.appendingSample(a, bucketStart: t0, down: 300, up: 30,
+                                                  netDown: 60, netUp: 6, cap: 10)
+        XCTAssertEqual(b.count, 1)
+        XCTAssertEqual(b[0].downAvg, 200)
+        XCTAssertEqual(b[0].netDownAvg, 50)
+        XCTAssertEqual(b[0].netUpAvg, 5)
+        let roundTrip = try! JSONDecoder().decode(SpeedHistoryStore.Bucket.self,
+                                                  from: JSONEncoder().encode(b[0]))
+        XCTAssertEqual(roundTrip.netDownSum, 100)
+    }
+
+    func test_scopedSample_swapsInInternetSeries() {
+        let s = SpeedHistoryStore.Sample(t: Date(), down: 100, up: 10, netDown: 40, netUp: 4)
+        XCTAssertEqual(s.scoped(.internet).down, 40)
+        XCTAssertEqual(s.scoped(.internet).up, 4)
+        XCTAssertEqual(s.scoped(.all), s)
+    }
+
+    /// The internet port breakdown drops local flows before grouping.
+    func test_internetConnections_excludeLocalFlows() {
+        let tracker = ProcessTracker()
+        let t0 = Date(), t1 = t0.addingTimeInterval(1)
+        func conns(_ a: UInt64, _ b: UInt64) -> [ConnectionSample] {
+            [ConnectionSample(pid: 9, proto: "tcp4", localIP: "192.168.1.5", localPort: 50001,
+                              remoteIP: "8.8.8.8", remotePort: 443, bytesIn: a, bytesOut: 0, interface: "en0"),
+             ConnectionSample(pid: 9, proto: "tcp4", localIP: "192.168.1.5", localPort: 50002,
+                              remoteIP: "192.168.1.10", remotePort: 443, bytesIn: b, bytesOut: 0, interface: "en0")]
+        }
+        _ = tracker.ingest(snapshot: [ProcessSample(pid: 9, processName: "App", bytesIn: 0, bytesOut: 0)],
+                           connections: conns(0, 0), snapshotTime: t0)
+        let app = tracker.ingest(snapshot: [ProcessSample(pid: 9, processName: "App", bytesIn: 3_000, bytesOut: 0)],
+                                 connections: conns(1_000, 2_000), snapshotTime: t1)
+            .first { $0.pids.contains(9) }!
+        XCTAssertEqual(app.connections(in: .all).first?.bytesIn, 3_000)
+        XCTAssertEqual(app.connections(in: .internet).first?.bytesIn, 1_000)
+        XCTAssertEqual(app.connections(in: .internet).first?.remotes.map(\.ip), ["8.8.8.8"])
+    }
+}

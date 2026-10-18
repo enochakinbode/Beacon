@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// Which slice of traffic a surface shows. `.internet` is the default: it's
 /// what metered / hotspot users actually pay for. `.all` adds loopback, LAN,
@@ -14,6 +15,23 @@ enum TrafficScope: String, CaseIterable, Identifiable {
         case .internet: return "Internet"
         case .all:      return "All Traffic"
         }
+    }
+}
+
+/// The app-wide scope choice, shared by the popover (via `NetworkViewModel`)
+/// and the floating chart panels. Defaults to `.internet`; persisted in
+/// UserDefaults so the last choice survives relaunch. Main-thread only.
+final class TrafficScopeSetting: ObservableObject {
+    static let shared = TrafficScopeSetting()
+    private static let defaultsKey = "computer.lighthouse.beacon.trafficScope"
+
+    @Published var scope: TrafficScope {
+        didSet { UserDefaults.standard.set(scope.rawValue, forKey: Self.defaultsKey) }
+    }
+
+    private init() {
+        let raw = UserDefaults.standard.string(forKey: Self.defaultsKey)
+        scope = raw.flatMap(TrafficScope.init(rawValue:)) ?? .internet
     }
 }
 

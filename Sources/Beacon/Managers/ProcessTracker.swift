@@ -108,6 +108,8 @@ final class ProcessTracker {
         /// in the bundle. Inner key is the remote endpoint id so we can roll
         /// distinct remotes up into a single AppConnection.remotes list.
         var connAgg: [String: ConnAgg] = [:]
+        /// Same as `connAgg`, internet flows only.
+        var internetConnAgg: [String: ConnAgg] = [:]
     }
 
     /// Mutable scratch type used inside `BundleAccumulator.connAgg` while we
@@ -388,39 +390,43 @@ final class ProcessTracker {
             // Drop flows that never moved bytes — listen sockets / metadata that
             // would just clutter the per-app list.
             if c.sessionBytesIn == 0 && c.sessionBytesOut == 0 { continue }
-
-            // Pick the SERVICE side. For an outbound/established flow the local
-            // port is an ephemeral throwaway and the remote port is the actual
-            // service (443=https, …). For a listener (remote is the "*"
-            // wildcard) the local port IS the service. Grouping on the service
-            // port is what makes the breakdown readable.
-            let isListener = (c.remoteIP == "*" || c.remotePort == 0)
-            let servicePort = isListener ? c.localPort : c.remotePort
-            let normProto = normalizedProto(c.proto)
-
-            let key = "\(normProto):\(servicePort)"
-            var agg = acc.connAgg[key] ?? ConnAgg(proto: normProto, port: servicePort)
-            agg.bytesIn  = agg.bytesIn  &+ c.sessionBytesIn
-            agg.bytesOut = agg.bytesOut &+ c.sessionBytesOut
-
-            // Peer rollup: the remote endpoint for outbound, "*" for listeners.
-            // Key on the IP only (the port equals the service port for outbound,
-            // so it carries no extra info in the peer line).
-            let peerIP = isListener ? "*" : c.remoteIP
-            let peerPort = isListener ? UInt16(0) : c.remotePort
-            let remoteKey = peerIP
-            var rem = agg.remotes[remoteKey] ?? RemoteAgg(ip: peerIP, port: peerPort)
-            rem.bytesIn  = rem.bytesIn  &+ c.sessionBytesIn
-            rem.bytesOut = rem.bytesOut &+ c.sessionBytesOut
-            agg.remotes[remoteKey] = rem
-
-            acc.connAgg[key] = agg
+            Self.fold(c, into: &acc.connAgg)
+            if !c.isLocal { Self.fold(c, into: &acc.internetConnAgg) }
         }
+    }
+
+    private static func fold(_ c: ConnState, into connAgg: inout [String: ConnAgg]) {
+        // Pick the SERVICE side. For an outbound/established flow the local
+        // port is an ephemeral throwaway and the remote port is the actual
+        // service (443=https, …). For a listener (remote is the "*"
+        // wildcard) the local port IS the service. Grouping on the service
+        // port is what makes the breakdown readable.
+        let isListener = (c.remoteIP == "*" || c.remotePort == 0)
+        let servicePort = isListener ? c.localPort : c.remotePort
+        let normProto = normalizedProto(c.proto)
+
+        let key = "\(normProto):\(servicePort)"
+        var agg = connAgg[key] ?? ConnAgg(proto: normProto, port: servicePort)
+        agg.bytesIn  = agg.bytesIn  &+ c.sessionBytesIn
+        agg.bytesOut = agg.bytesOut &+ c.sessionBytesOut
+
+        // Peer rollup: the remote endpoint for outbound, "*" for listeners.
+        // Key on the IP only (the port equals the service port for outbound,
+        // so it carries no extra info in the peer line).
+        let peerIP = isListener ? "*" : c.remoteIP
+        let peerPort = isListener ? UInt16(0) : c.remotePort
+        let remoteKey = peerIP
+        var rem = agg.remotes[remoteKey] ?? RemoteAgg(ip: peerIP, port: peerPort)
+        rem.bytesIn  = rem.bytesIn  &+ c.sessionBytesIn
+        rem.bytesOut = rem.bytesOut &+ c.sessionBytesOut
+        agg.remotes[remoteKey] = rem
+
+        connAgg[key] = agg
     }
 
     /// Drop the trailing IP-family digit so tcp4/tcp6 (and udp4/udp6) to the
     /// same service collapse into one row.
-    private func normalizedProto(_ proto: String) -> String {
+    private static func normalizedProto(_ proto: String) -> String {
         if proto.hasPrefix("tcp") { return "tcp" }
         if proto.hasPrefix("udp") { return "udp" }
         return proto
@@ -520,7 +526,8 @@ final class ProcessTracker {
                 internetDownloadSpeed: acc.internetDownloadSpeed,
                 internetUploadSpeed: acc.internetUploadSpeed,
                 internetBytesIn: acc.internetBytesIn,
-                internetBytesOut: acc.internetBytesOut
+                internetBytesOut: acc.internetBytesOut,
+                internetConnections: materializeConnections(acc.internetConnAgg)
             )
         }
     }

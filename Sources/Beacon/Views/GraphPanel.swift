@@ -114,6 +114,9 @@ final class GraphPanelInstance: ObservableObject, Identifiable {
 /// like one product.
 struct ExpandedGraphView: View {
     @ObservedObject var instance: GraphPanelInstance
+    /// Internet / All Traffic, shared with the popover's header dropdown —
+    /// switching it there re-scopes every open chart.
+    @ObservedObject private var scopeSetting = TrafficScopeSetting.shared
     /// Pin requests bubble up to the controller (which may refuse if at cap).
     let onTogglePin: () -> Void
     /// Close button on pinned panels routes through the controller so it
@@ -180,14 +183,17 @@ struct ExpandedGraphView: View {
         // while resizing.
         .onReceive(LiveClock.shared.$now) { _ in refreshCaches() }
         .onChange(of: range) { _ in refreshCaches() }
+        .onChange(of: scopeSetting.scope) { _ in refreshCaches() }
     }
 
+    private var scope: TrafficScope { scopeSetting.scope }
+
     private func refreshCaches() {
-        let newSamples = SpeedHistoryStore.shared.series(forId: instance.appId, range: range)
+        let newSamples = SpeedHistoryStore.shared.series(forId: instance.appId, range: range, scope: scope)
         if newSamples != cachedSamples { cachedSamples = newSamples }
         let live = LatestSnapshotStore.shared.usage(forId: instance.appId)
         if live != cachedLive { cachedLive = live }
-        let conns = live?.connections ?? []
+        let conns = live?.connections(in: scope) ?? []
         if conns != cachedConnections { cachedConnections = conns }
     }
 
@@ -195,7 +201,7 @@ struct ExpandedGraphView: View {
 
     private var header: some View {
         let live = cachedLive
-        let active = live?.isActive ?? false
+        let active = live?.isActive(in: scope) ?? false
         return VStack(alignment: .leading, spacing: 4) {
             // Row 1: activity dot · name · trust · timeframe · pin · close
             HStack(spacing: 8) {
@@ -236,12 +242,20 @@ struct ExpandedGraphView: View {
                 Text(active ? "Active now" : "Idle")
                     .font(.system(size: 10))
                     .foregroundColor(active ? .accentColor : .secondary)
+                Spacer(minLength: 4)
+                Text(scope.label)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.18)))
+                    .help("Change in the popover header")
             }
 
             // Row 3: live ↓/↑ totals.
             HStack(spacing: 12) {
                 Label {
-                    Text(FormatUtility.formatSpeed(live?.downloadSpeed ?? 0))
+                    Text(FormatUtility.formatSpeed(live?.downloadSpeed(in: scope) ?? 0))
                         .font(.system(size: 11, weight: .medium))
                 } icon: {
                     Image(systemName: "arrow.down")
@@ -249,7 +263,7 @@ struct ExpandedGraphView: View {
                         .foregroundColor(.blue)
                 }
                 Label {
-                    Text(FormatUtility.formatSpeed(live?.uploadSpeed ?? 0))
+                    Text(FormatUtility.formatSpeed(live?.uploadSpeed(in: scope) ?? 0))
                         .font(.system(size: 11, weight: .medium))
                 } icon: {
                     Image(systemName: "arrow.up")
@@ -369,7 +383,7 @@ struct ExpandedGraphView: View {
             }
             .padding(.horizontal, 2)
             if cachedConnections.isEmpty {
-                Text("No active connections")
+                Text(scope == .internet ? "No internet connections" : "No active connections")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

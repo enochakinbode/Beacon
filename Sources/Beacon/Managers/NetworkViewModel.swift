@@ -18,15 +18,19 @@ class NetworkViewModel: ObservableObject {
     /// Per-app list that drives the popover. Also gated on visibility.
     @Published var appUsages: [AppNetworkUsage] = []
 
-    /// Which traffic the popover lists — the dropdown in the header.
-    /// Defaults to `.internet`; the last choice is remembered across launches.
-    @Published var scope: TrafficScope = {
-        let raw = UserDefaults.standard.string(forKey: NetworkViewModel.scopeDefaultsKey)
-        return raw.flatMap(TrafficScope.init(rawValue:)) ?? .internet
-    }() {
-        didSet { UserDefaults.standard.set(scope.rawValue, forKey: Self.scopeDefaultsKey) }
+    /// Which traffic the popover lists — the dropdown in the header. Backed by
+    /// `TrafficScopeSetting` so open chart panels follow the same choice.
+    var scope: TrafficScope {
+        get { TrafficScopeSetting.shared.scope }
+        set { TrafficScopeSetting.shared.scope = newValue }
     }
-    private static let scopeDefaultsKey = "computer.lighthouse.beacon.trafficScope"
+    /// Re-publishes scope changes so views bound to this model re-render.
+    private var scopeCancellable: AnyCancellable?
+
+    init() {
+        scopeCancellable = TrafficScopeSetting.shared.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+    }
 
     /// Always-on feed for the menu-bar title (today's internet total). Fired
     /// every tick whether or not any window is open. AppKit-side (a label

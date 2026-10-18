@@ -18,10 +18,22 @@ import Foundation
 final class SpeedHistoryStore {
     static let shared = SpeedHistoryStore()
 
+    /// `down` / `up` are all-traffic speeds; `netDown` / `netUp` the
+    /// internet-only slice. `series(forId:range:scope:)` returns samples whose
+    /// `down` / `up` already hold the requested scope's values, so chart code
+    /// never has to pick.
     struct Sample: Equatable {
         let t: Date
         let down: Double
         let up: Double
+        var netDown: Double = 0
+        var netUp: Double = 0
+
+        func scoped(_ scope: TrafficScope) -> Sample {
+            scope == .internet
+                ? Sample(t: t, down: netDown, up: netUp, netDown: netDown, netUp: netUp)
+                : self
+        }
     }
 
     /// Which stored tier a query should read from.
@@ -41,8 +53,18 @@ final class SpeedHistoryStore {
         var downSum: Double
         var upSum: Double
         var count: Int
+        /// Internet-only sums. Absent from files written before the internet
+        /// split; those buckets decode as 0 (see `init(from:)` below).
+        var netDownSum: Double = 0
+        var netUpSum: Double = 0
         var downAvg: Double { count > 0 ? downSum / Double(count) : 0 }
         var upAvg: Double { count > 0 ? upSum / Double(count) : 0 }
+        var netDownAvg: Double { count > 0 ? netDownSum / Double(count) : 0 }
+        var netUpAvg: Double { count > 0 ? netUpSum / Double(count) : 0 }
+
+        var sample: Sample {
+            Sample(t: start, down: downAvg, up: upAvg, netDown: netDownAvg, netUp: netUpAvg)
+        }
     }
 
     private var minute: [String: [Bucket]] = [:]
@@ -117,14 +139,17 @@ final class SpeedHistoryStore {
             for app in apps {
                 // Tier 1 — raw ring.
                 var r = self.raw[app.id] ?? []
-                r.append(Sample(t: now, down: app.downloadSpeed, up: app.uploadSpeed))
+                r.append(Sample(t: now, down: app.downloadSpeed, up: app.uploadSpeed,
+                                netDown: app.internetDownloadSpeed, netUp: app.internetUploadSpeed))
                 if r.count > self.rawCap { r.removeFirst(r.count - self.rawCap) }
                 self.raw[app.id] = r
 
                 // Tier 2 — minute buckets.
                 self.accumulate(
                     into: &self.minute, id: app.id, bucketStart: minuteStart,
-                    down: app.downloadSpeed, up: app.uploadSpeed, cap: self.minuteCap,
+                    down: app.downloadSpeed, up: app.uploadSpeed,
+                    netDown: app.internetDownloadSpeed, netUp: app.internetUploadSpeed,
+                    cap: self.minuteCap,
                     foldWindow: minuteFold
                 )
                 // Tier 3 — hour buckets. Without a tier-scaled fold window the
@@ -135,7 +160,9 @@ final class SpeedHistoryStore {
                 // (multi-hour) jump.
                 self.accumulate(
                     into: &self.hour, id: app.id, bucketStart: hourStart,
-                    down: app.downloadSpeed, up: app.uploadSpeed, cap: self.hourCap,
+                    down: app.downloadSpeed, up: app.uploadSpeed,
+                    netDown: app.internetDownloadSpeed, netUp: app.internetUploadSpeed,
+                    cap: self.hourCap,
                     foldWindow: hourFold
                 )
             }
@@ -146,10 +173,12 @@ final class SpeedHistoryStore {
     private func accumulate(
         into store: inout [String: [Bucket]],
         id: String, bucketStart: Date,
-        down: Double, up: Double, cap: Int, foldWindow: TimeInterval
+        down: Double, up: Double, netDown: Double, netUp: Double,
+        cap: Int, foldWindow: TimeInterval
     ) {
         store[id] = Self.appendingSample(store[id] ?? [], bucketStart: bucketStart,
-                                         down: down, up: up, cap: cap, foldWindow: foldWindow)
+                                         down: down, up: up, netDown: netDown, netUp: netUp,
+                                         cap: cap, foldWindow: foldWindow)
     }
 
     /// Pure, testable bucket append. Folds one sample into `bucketStart`'s bucket
@@ -173,30 +202,36 @@ final class SpeedHistoryStore {
     ///   new clock those timestamps haven't happened yet) and resume recording at
     ///   `bucketStart`. The axis stays monotonic and the chart keeps moving.
     static func appendingSample(
-        _ arr: [Bucket], bucketStart: Date, down: Double, up: Double, cap: Int,
+        _ arr: [Bucket], bucketStart: Date, down: Double, up: Double,
+        netDown: Double = 0, netUp: Double = 0, cap: Int,
         foldWindow: TimeInterval = 120
     ) -> [Bucket] {
         var arr = arr
+        func fold(_ b: inout Bucket) {
+            b.downSum += down
+            b.upSum += up
+            b.netDownSum += netDown
+            b.netUpSum += netUp
+            b.count += 1
+        }
+        let fresh = Bucket(start: bucketStart, downSum: down, upSum: up, count: 1,
+                           netDownSum: netDown, netUpSum: netUp)
         if var last = arr.last, last.start >= bucketStart {
             if last.start.timeIntervalSince(bucketStart) <= foldWindow {
-                last.downSum += down
-                last.upSum += up
-                last.count += 1
+                fold(&last)
                 arr[arr.count - 1] = last
             } else {
                 // Large backward step — rebase onto the new clock.
                 arr.removeAll { $0.start > bucketStart }
                 if var tail = arr.last, tail.start == bucketStart {
-                    tail.downSum += down
-                    tail.upSum += up
-                    tail.count += 1
+                    fold(&tail)
                     arr[arr.count - 1] = tail
                 } else {
-                    arr.append(Bucket(start: bucketStart, downSum: down, upSum: up, count: 1))
+                    arr.append(fresh)
                 }
             }
         } else {
-            arr.append(Bucket(start: bucketStart, downSum: down, upSum: up, count: 1))
+            arr.append(fresh)
         }
         if arr.count > cap { arr.removeFirst(arr.count - cap) }
         return arr
@@ -225,7 +260,9 @@ final class SpeedHistoryStore {
             out.append(Sample(
                 t: chunk[chunk.startIndex].t,
                 down: chunk.reduce(0) { $0 + $1.down } / n,
-                up: chunk.reduce(0) { $0 + $1.up } / n
+                up: chunk.reduce(0) { $0 + $1.up } / n,
+                netDown: chunk.reduce(0) { $0 + $1.netDown } / n,
+                netUp: chunk.reduce(0) { $0 + $1.netUp } / n
             ))
             i += stride
         }
@@ -234,24 +271,22 @@ final class SpeedHistoryStore {
 
     // MARK: - Query
 
-    /// Time-series for one app over `range`, at the appropriate resolution.
+    /// Time-series for one app over `range`, at the appropriate resolution,
+    /// with `down` / `up` holding `scope`'s speeds (see `Sample.scoped`).
     /// Empty if we have no data for that id/range yet.
-    func series(forId id: String, range: GraphTimeRange) -> [Sample] {
-        queue.sync {
+    func series(forId id: String, range: GraphTimeRange, scope: TrafficScope = .all) -> [Sample] {
+        let samples: [Sample] = queue.sync {
             let cutoff = Date().addingTimeInterval(-range.seconds)
             switch range.resolution {
             case .raw:
                 return Self.downsample((raw[id] ?? []).filter { $0.t >= cutoff }, target: 720)
             case .minute:
-                return (minute[id] ?? [])
-                    .filter { $0.start >= cutoff }
-                    .map { Sample(t: $0.start, down: $0.downAvg, up: $0.upAvg) }
+                return (minute[id] ?? []).filter { $0.start >= cutoff }.map(\.sample)
             case .hour:
-                return (hour[id] ?? [])
-                    .filter { $0.start >= cutoff }
-                    .map { Sample(t: $0.start, down: $0.downAvg, up: $0.upAvg) }
+                return (hour[id] ?? []).filter { $0.start >= cutoff }.map(\.sample)
             }
         }
+        return scope == .all ? samples : samples.map { $0.scoped(scope) }
     }
 
     // MARK: - Persistence impl
@@ -375,5 +410,19 @@ final class SpeedHistoryStore {
 
     deinit {
         saveTimer?.cancel()
+    }
+}
+
+extension SpeedHistoryStore.Bucket {
+    /// Hand-written (in an extension, so the memberwise init survives) only to
+    /// tolerate the internet sums being absent from pre-split history files.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        start = try c.decode(Date.self, forKey: .start)
+        downSum = try c.decode(Double.self, forKey: .downSum)
+        upSum = try c.decode(Double.self, forKey: .upSum)
+        count = try c.decode(Int.self, forKey: .count)
+        netDownSum = try c.decodeIfPresent(Double.self, forKey: .netDownSum) ?? 0
+        netUpSum = try c.decodeIfPresent(Double.self, forKey: .netUpSum) ?? 0
     }
 }

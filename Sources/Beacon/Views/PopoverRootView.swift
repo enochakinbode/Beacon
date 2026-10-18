@@ -825,7 +825,7 @@ struct LifetimeRowView: View {
     }
 
     private func openGraph() {
-        let initial: GraphTimeRange = (live?.isActive ?? false) ? .live : .oneDay
+        let initial: GraphTimeRange = (live?.isActive(in: scope) ?? false) ? .live : .oneDay
         GraphPanelController.shared.show(
             appId: entry.id,
             displayName: entry.displayName,
