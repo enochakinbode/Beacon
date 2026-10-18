@@ -138,7 +138,7 @@ final class DailyUsageStore {
         guard dirty, let data = encoded() else { return }
         dirty = false
         let url = storeURL
-        writeQueue.async {
+        writeQueue.async { [weak self] in
             do { try data.write(to: url, options: .atomic) }
             catch { DispatchQueue.main.async { [weak self] in self?.dirty = true } }
         }
