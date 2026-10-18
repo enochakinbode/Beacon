@@ -30,6 +30,9 @@ struct ParsedConnectionRow: Equatable {
     let bytesIn: UInt64
     /// Cumulative bytes_out.
     let bytesOut: UInt64
+    /// nettop's `interface` column (`en0`, `lo0`, `awdl0`, …). Empty when nettop
+    /// leaves it blank. Feeds `TrafficClassifier`'s internet-vs-local split.
+    var interface: String = ""
 }
 
 /// Result of parsing one nettop line. Header rows, blanks, and any unparseable
@@ -125,7 +128,8 @@ enum NettopLineParser {
             remoteIP: remoteIP,
             remotePort: remotePort,
             bytesIn: bytesIn,
-            bytesOut: bytesOut
+            bytesOut: bytesOut,
+            interface: cols[2].trimmingCharacters(in: .whitespaces)
         )
     }
 

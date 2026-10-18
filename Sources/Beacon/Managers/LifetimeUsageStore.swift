@@ -22,8 +22,44 @@ struct LifetimeUsage: Codable, Identifiable, Equatable {
     var totalBytesOut: UInt64
     var firstSeen: Date
     var lastSeen: Date
+    /// Internet-only slice of the totals above. Added after 1.0, so rows saved
+    /// by older builds decode as 0 — internet accounting starts from the first
+    /// launch of a build that tracks it (see `init(from:)`).
+    var internetBytesIn: UInt64 = 0
+    var internetBytesOut: UInt64 = 0
 
     var totalBytes: UInt64 { saturatingAdd(totalBytesIn, totalBytesOut) }
+
+    func bytesIn(in scope: TrafficScope) -> UInt64 {
+        scope == .internet ? internetBytesIn : totalBytesIn
+    }
+
+    func bytesOut(in scope: TrafficScope) -> UInt64 {
+        scope == .internet ? internetBytesOut : totalBytesOut
+    }
+
+    func totalBytes(in scope: TrafficScope) -> UInt64 {
+        saturatingAdd(bytesIn(in: scope), bytesOut(in: scope))
+    }
+}
+
+extension LifetimeUsage {
+    /// Hand-written (in an extension, so the memberwise init survives) only to
+    /// tolerate the internet fields being absent from pre-split files. Older
+    /// builds reading a newer file just ignore the extra keys.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        bundleIdentifier = try c.decodeIfPresent(String.self, forKey: .bundleIdentifier)
+        bundlePath = try c.decodeIfPresent(String.self, forKey: .bundlePath)
+        totalBytesIn = try c.decode(UInt64.self, forKey: .totalBytesIn)
+        totalBytesOut = try c.decode(UInt64.self, forKey: .totalBytesOut)
+        firstSeen = try c.decode(Date.self, forKey: .firstSeen)
+        lastSeen = try c.decode(Date.self, forKey: .lastSeen)
+        internetBytesIn = try c.decodeIfPresent(UInt64.self, forKey: .internetBytesIn) ?? 0
+        internetBytesOut = try c.decodeIfPresent(UInt64.self, forKey: .internetBytesOut) ?? 0
+    }
 }
 
 /// Cross-session cumulative store. The live ProcessTracker only knows about
@@ -69,7 +105,15 @@ final class LifetimeUsageStore: ObservableObject {
     /// Token for the LiveUIGate subscription that flushes on open.
     private var gateToken: UUID?
     /// Last seen session totals per app id (queue-owned).
-    private var lastSessionBytes: [String: (UInt64, UInt64)] = [:]
+    private var lastSessionBytes: [String: SessionBaseline] = [:]
+
+    /// One app's session-cumulative counters as of the previous tick.
+    private struct SessionBaseline {
+        let bytesIn: UInt64
+        let bytesOut: UInt64
+        let internetIn: UInt64
+        let internetOut: UInt64
+    }
     /// Dirty flag (queue-owned).
     private var dirty: Bool = false
 
@@ -139,22 +183,29 @@ final class LifetimeUsageStore: ObservableObject {
                 // counters, so the next tick re-banked the entire session total
                 // back onto the freshly-wiped lifetime store.
                 let baseline = lastSessionBytes[app.id]
-                lastSessionBytes[app.id] = (app.totalBytesIn, app.totalBytesOut)
-                let dIn:  UInt64
-                let dOut: UInt64
-                if let prev = baseline {
-                    dIn  = app.totalBytesIn  >= prev.0 ? app.totalBytesIn  - prev.0 : 0
-                    dOut = app.totalBytesOut >= prev.1 ? app.totalBytesOut - prev.1 : 0
-                } else {
-                    dIn = 0
-                    dOut = 0
+                lastSessionBytes[app.id] = SessionBaseline(
+                    bytesIn: app.totalBytesIn, bytesOut: app.totalBytesOut,
+                    internetIn: app.internetBytesIn, internetOut: app.internetBytesOut
+                )
+                func delta(_ now: UInt64, _ prev: UInt64?) -> UInt64 {
+                    guard let prev else { return 0 }
+                    return now >= prev ? now - prev : 0
                 }
+                let dIn  = delta(app.totalBytesIn,  baseline?.bytesIn)
+                let dOut = delta(app.totalBytesOut, baseline?.bytesOut)
+                // Clamp to the all-traffic delta so internet can never exceed
+                // total even if the two counters regress on different ticks
+                // (PID pruning within a bundle).
+                let dNetIn  = min(delta(app.internetBytesIn,  baseline?.internetIn),  dIn)
+                let dNetOut = min(delta(app.internetBytesOut, baseline?.internetOut), dOut)
 
                 if dIn == 0 && dOut == 0 && queueEntries[app.id] != nil { continue }
 
                 if var existing = queueEntries[app.id] {
                     existing.totalBytesIn  = saturatingAdd(existing.totalBytesIn,  dIn)
                     existing.totalBytesOut = saturatingAdd(existing.totalBytesOut, dOut)
+                    existing.internetBytesIn  = saturatingAdd(existing.internetBytesIn,  dNetIn)
+                    existing.internetBytesOut = saturatingAdd(existing.internetBytesOut, dNetOut)
                     existing.lastSeen = now
                     existing.displayName = app.displayName
                     existing.bundleIdentifier = app.bundleIdentifier ?? existing.bundleIdentifier
@@ -169,7 +220,9 @@ final class LifetimeUsageStore: ObservableObject {
                         totalBytesIn: dIn,
                         totalBytesOut: dOut,
                         firstSeen: now,
-                        lastSeen: now
+                        lastSeen: now,
+                        internetBytesIn: dNetIn,
+                        internetBytesOut: dNetOut
                     )
                 }
                 changed = true

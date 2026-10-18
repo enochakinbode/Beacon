@@ -27,6 +27,8 @@ struct ConnectionSample {
     let remotePort: UInt16
     let bytesIn: UInt64
     let bytesOut: UInt64
+    /// nettop interface (`en0`, `lo0`, `awdl0`, …); "" when unreported.
+    var interface: String = ""
 }
 
 // MARK: - NetworkMonitor
@@ -214,7 +216,8 @@ final class NetworkMonitor {
                     remoteIP: c.remoteIP,
                     remotePort: c.remotePort,
                     bytesIn: c.bytesIn,
-                    bytesOut: c.bytesOut
+                    bytesOut: c.bytesOut,
+                    interface: c.interface
                 ))
             }
         }

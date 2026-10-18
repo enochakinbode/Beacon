@@ -140,8 +140,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // by the menu bar's ticking. The popover's own currentSpeed/appUsages
         // are gated separately on LiveUIGate. onSnapshot is delivered on main,
         // so this closure runs on main.
-        viewModel?.onSpeedUpdate = { [weak self] speed in
-            self?.updateMenuBarTitle(with: speed)
+        viewModel?.onDailyUsageUpdate = { [weak self] today in
+            self?.updateMenuBarTitle(with: today)
         }
         viewModel?.startMonitoring()
 
@@ -237,6 +237,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            // Larger than the ~13pt menu-bar default so the daily total reads
+            // at a glance; monospaced digits keep the item's width steady as
+            // the number ticks up.
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: Self.menuBarFontSize, weight: .regular)
         }
 
         updateMenuBarTitle()
@@ -310,8 +314,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// clickable item and repaints the current title.
     private func rebuildStatusItem() {
         setupMenuBar()
-        // setupMenuBar paints a zero baseline; the always-on onSpeedUpdate feed
-        // repaints the live title on the next tick (≤1s).
+        // setupMenuBar repaints from DailyUsageStore immediately; the always-on
+        // onDailyUsageUpdate feed keeps it current from the next tick (≤1s).
     }
 
     /// Install the wake / screen-change observers and the slow health-check timer
@@ -473,23 +477,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
-    /// Update the status-item title from an explicit speed. Driven by the
-    /// view-model's always-on `onSpeedUpdate` feed so the menu bar keeps ticking
-    /// independently of UI visibility.
-    ///
-    /// One-line format (`↓ N ↑ N`) using the same full `B/s`–`TB/s` units as the
-    /// popover and charts (`FormatUtility.formatSpeed`), so every speed readout in
-    /// the app speaks one unit vocabulary. A single space separates the download
-    /// and upload readings — the ↓/↑ glyphs already delimit them, so a gap reads
-    /// cleaner than a punctuation separator.
-    private func updateMenuBarTitle(with speed: NetworkSpeed) {
+    private static let menuBarFontSize: CGFloat = 14
+    private static let menuBarBaselineOffset: CGFloat = -2
+
+    /// Update the status-item title with today's internet total (download +
+    /// upload, every process, local-network traffic excluded). Driven by the
+    /// view-model's always-on `onDailyUsageUpdate` feed so the menu bar keeps
+    /// ticking independently of UI visibility. Text only — no icon. Uses `FormatUtility.formatBytes`,
+    /// the same unit vocabulary as the popover rows. Only touches the button
+    /// when the text actually changes — most ticks it doesn't.
+    private func updateMenuBarTitle(with today: DayUsage) {
         guard let button = statusItem?.button else { return }
-        button.title = "↓ \(speed.downloadFormatted) ↑ \(speed.uploadFormatted)"
+        let title = FormatUtility.formatBytes(today.internetBytes)
+        if button.title != title {
+            // Attributed so the text can sit slightly below the button's
+            // default vertical center (negative baseline offset = lower).
+            button.attributedTitle = NSAttributedString(string: title, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: Self.menuBarFontSize, weight: .regular),
+                .baselineOffset: Self.menuBarBaselineOffset,
+            ])
+        }
+        let tip = "Internet today: ↓ \(FormatUtility.formatBytes(today.internetBytesIn))  ↑ \(FormatUtility.formatBytes(today.internetBytesOut))"
+        if button.toolTip != tip { button.toolTip = tip }
     }
 
-    /// Initial title before the first snapshot arrives.
+    /// Initial title before the first snapshot arrives — today's persisted total.
     private func updateMenuBarTitle() {
-        updateMenuBarTitle(with: NetworkSpeed(timestamp: Date(), downloadSpeed: 0, uploadSpeed: 0))
+        updateMenuBarTitle(with: DailyUsageStore.shared.today)
     }
 
     // MARK: - Click Handling
@@ -946,7 +960,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc func resetAllTimeData() {
         let alert = NSAlert()
         alert.messageText = "Reset all-time data?"
-        alert.informativeText = "This clears every app's cross-session total. The session totals collected since the app started keep counting; only the saved historical totals on disk are wiped. This can't be undone."
+        alert.informativeText = "This clears every app's cross-session total and today's internet total in the menu bar. The session totals collected since the app started keep counting; only the saved historical totals on disk are wiped. This can't be undone."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
@@ -957,6 +971,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
             LifetimeUsageStore.shared.resetAll()
+            DailyUsageStore.shared.resetAll()
+            updateMenuBarTitle()
         }
         // Drop back to accessory so the dock doesn't keep us focused.
         NSApp.setActivationPolicy(.accessory)
@@ -970,6 +986,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // last few seconds of traffic + buckets were lost.
         LifetimeUsageStore.shared.saveBlocking()
         SpeedHistoryStore.shared.saveBlocking()
+        DailyUsageStore.shared.saveBlocking()
         NSApplication.shared.terminate(nil)
     }
 

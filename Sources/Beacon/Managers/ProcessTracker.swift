@@ -42,6 +42,10 @@ final class ProcessTracker {
         var lastTimestamp: Date
         var sessionBytesIn: UInt64
         var sessionBytesOut: UInt64
+        /// Internet-only slice of the session bytes (total minus flows that
+        /// `TrafficClassifier` tags local). See `applyInternetSplit`.
+        var internetSessionBytesIn: UInt64 = 0
+        var internetSessionBytesOut: UInt64 = 0
         var identity: ProcessIdentity
     }
 
@@ -59,6 +63,9 @@ final class ProcessTracker {
         let localPort: UInt16
         let remoteIP: String
         let remotePort: UInt16
+        /// Classified once when the flow is first seen — the endpoints and
+        /// interface of a flow don't change over its life.
+        let isLocal: Bool
         var lastBytesIn: UInt64
         var lastBytesOut: UInt64
         var sessionBytesIn: UInt64
@@ -91,6 +98,10 @@ final class ProcessTracker {
         var uploadSpeed: Double = 0
         var totalBytesIn: UInt64 = 0
         var totalBytesOut: UInt64 = 0
+        var internetDownloadSpeed: Double = 0
+        var internetUploadSpeed: Double = 0
+        var internetBytesIn: UInt64 = 0
+        var internetBytesOut: UInt64 = 0
         /// True if ANY contributing PID was launched from a terminal.
         var launchedFromTerminal: Bool = false
         /// Per-(proto, localPort) aggregation of connection state from all PIDs
@@ -131,6 +142,9 @@ final class ProcessTracker {
         snapshotTime: Date
     ) -> [AppNetworkUsage] {
         let seenPids = Set(snapshot.map { $0.pid })
+        // This tick's per-PID byte deltas (only for PIDs with a prior baseline),
+        // kept so the connection pass can split them into internet vs local.
+        var tickDeltas: [Int32: TickDelta] = [:]
 
         for sample in snapshot {
             // PID reuse vs. live exec. macOS recycles PIDs, and a live process
@@ -149,6 +163,7 @@ final class ProcessTracker {
                 pidStates[sample.pid] = nil
                 connStates[sample.pid] = nil
                 lastSpeedByPid[sample.pid] = nil
+                lastInternetSpeedByPid[sample.pid] = nil
                 identityCache[sample.pid] = nil
             }
 
@@ -182,6 +197,8 @@ final class ProcessTracker {
                 lastSpeedByPid[sample.pid] = anomalousInterval
                     ? (download: 0, upload: 0)
                     : (download: Double(inDelta) / dt, upload: Double(outDelta) / dt)
+                tickDeltas[sample.pid] = TickDelta(bytesIn: inDelta, bytesOut: outDelta,
+                                                   dt: dt, anomalous: anomalousInterval)
 
                 state.lastTimestamp = snapshotTime
                 state.identity = identity
@@ -197,6 +214,7 @@ final class ProcessTracker {
                     identity: identity
                 )
                 lastSpeedByPid[sample.pid] = (download: 0, upload: 0)
+                lastInternetSpeedByPid[sample.pid] = (download: 0, upload: 0)
             }
         }
 
@@ -208,12 +226,52 @@ final class ProcessTracker {
         // spawns would otherwise stay resident forever and slow aggregation.
         for pid in pidStates.keys where !seenPids.contains(pid) {
             lastSpeedByPid[pid] = (download: 0, upload: 0)
+            lastInternetSpeedByPid[pid] = (download: 0, upload: 0)
         }
         prunePids(notSeenSince: snapshotTime.addingTimeInterval(-pidRetentionGrace))
 
-        ingestConnections(connections)
+        let localDeltas = ingestConnections(connections, pidsWithBaseline: Set(tickDeltas.keys))
+        applyInternetSplit(tickDeltas: tickDeltas, localDeltas: localDeltas)
 
         return aggregateByBundle()
+    }
+
+    /// One PID's byte movement in the current tick.
+    private struct TickDelta {
+        let bytesIn: UInt64
+        let bytesOut: UInt64
+        let dt: TimeInterval
+        let anomalous: Bool
+    }
+
+    /// Internet bytes moved this tick across every process (all PIDs, ignored
+    /// apps included). Feeds the daily internet total in the menu bar — read it
+    /// right after `ingest`.
+    private(set) var lastTickInternetBytes: (bytesIn: UInt64, bytesOut: UInt64) = (0, 0)
+
+    /// Split each PID's tick delta into internet and local. The process row is
+    /// the authoritative byte count (it includes sockets that closed mid-tick),
+    /// so internet = process delta − delta on flows classified local, clamped
+    /// at zero. Bytes we can't attribute to a local flow count as internet.
+    private func applyInternetSplit(tickDeltas: [Int32: TickDelta],
+                                    localDeltas: [Int32: (bytesIn: UInt64, bytesOut: UInt64)]) {
+        var tickIn: UInt64 = 0
+        var tickOut: UInt64 = 0
+        for (pid, d) in tickDeltas {
+            guard var state = pidStates[pid] else { continue }
+            let local = localDeltas[pid] ?? (0, 0)
+            let netIn  = d.bytesIn  - min(local.bytesIn,  d.bytesIn)
+            let netOut = d.bytesOut - min(local.bytesOut, d.bytesOut)
+            state.internetSessionBytesIn  = state.internetSessionBytesIn  &+ netIn
+            state.internetSessionBytesOut = state.internetSessionBytesOut &+ netOut
+            pidStates[pid] = state
+            lastInternetSpeedByPid[pid] = d.anomalous
+                ? (download: 0, upload: 0)
+                : (download: Double(netIn) / d.dt, upload: Double(netOut) / d.dt)
+            tickIn  = tickIn  &+ netIn
+            tickOut = tickOut &+ netOut
+        }
+        lastTickInternetBytes = (tickIn, tickOut)
     }
 
     /// Same delta-tracking pattern as `pidStates` but per-flow. Cumulative
@@ -225,8 +283,20 @@ final class ProcessTracker {
     /// closed socket and is dropped. We deliberately don't prune PIDs absent
     /// from `samples` entirely (a PID can stay tracked across idle ticks via
     /// the pidStates grace), only flows for PIDs that *did* report.
-    private func ingestConnections(_ samples: [ConnectionSample]) {
+    ///
+    /// Returns this tick's byte delta on *local* flows per PID, for the
+    /// internet/local split. A flow seen for the first time under a PID that
+    /// already had a baseline opened during this tick, so its whole cumulative
+    /// count is this tick's delta (the PID's process-row delta includes it).
+    @discardableResult
+    private func ingestConnections(_ samples: [ConnectionSample],
+                                   pidsWithBaseline: Set<Int32> = []) -> [Int32: (bytesIn: UInt64, bytesOut: UInt64)] {
         var seenByPid: [Int32: Set<ConnKey>] = [:]
+        var localDeltas: [Int32: (bytesIn: UInt64, bytesOut: UInt64)] = [:]
+        func addLocal(_ pid: Int32, _ dIn: UInt64, _ dOut: UInt64) {
+            let cur = localDeltas[pid] ?? (0, 0)
+            localDeltas[pid] = (cur.bytesIn &+ dIn, cur.bytesOut &+ dOut)
+        }
         for c in samples {
             let key = ConnKey(proto: c.proto, localIP: c.localIP,
                               localPort: c.localPort,
@@ -240,14 +310,23 @@ final class ProcessTracker {
                 state.sessionBytesOut = state.sessionBytesOut &+ outDelta
                 state.lastBytesIn  = c.bytesIn
                 state.lastBytesOut = c.bytesOut
+                if state.isLocal { addLocal(c.pid, inDelta, outDelta) }
                 byKey[key] = state
             } else {
+                let isLocal = TrafficClassifier.isLocal(
+                    interface: c.interface, localIP: c.localIP,
+                    localPort: c.localPort, remoteIP: c.remoteIP
+                )
+                if isLocal && pidsWithBaseline.contains(c.pid) {
+                    addLocal(c.pid, c.bytesIn, c.bytesOut)
+                }
                 byKey[key] = ConnState(
                     proto: c.proto,
                     localIP: c.localIP,
                     localPort: c.localPort,
                     remoteIP: c.remoteIP,
                     remotePort: c.remotePort,
+                    isLocal: isLocal,
                     lastBytesIn: c.bytesIn,
                     lastBytesOut: c.bytesOut,
                     sessionBytesIn: 0,
@@ -263,6 +342,7 @@ final class ProcessTracker {
             }
             connStates[pid] = byKey
         }
+        return localDeltas
     }
 
     /// Grace window before a PID absent from nettop output is evicted. Long
@@ -286,6 +366,7 @@ final class ProcessTracker {
         for pid in dead {
             pidStates[pid] = nil
             lastSpeedByPid[pid] = nil
+            lastInternetSpeedByPid[pid] = nil
             identityCache[pid] = nil
             connStates[pid] = nil
         }
@@ -294,6 +375,8 @@ final class ProcessTracker {
     /// Sidecar map of last-tick speeds per PID. Kept separate so the PID state struct
     /// stays focused on cumulative tracking.
     private var lastSpeedByPid: [Int32: (download: Double, upload: Double)] = [:]
+    /// Internet-only counterpart of `lastSpeedByPid`.
+    private var lastInternetSpeedByPid: [Int32: (download: Double, upload: Double)] = [:]
 
     /// Merge one PID's connection state into the bundle accumulator. Multiple
     /// PIDs of the same app sharing a local port (e.g. several Chrome helpers
@@ -370,6 +453,7 @@ final class ProcessTracker {
         for (pid, state) in pidStates {
             let key = state.identity.bundleIdentifier ?? state.identity.displayName
             let speed = lastSpeedByPid[pid] ?? (download: 0, upload: 0)
+            let netSpeed = lastInternetSpeedByPid[pid] ?? (download: 0, upload: 0)
 
             if var acc = accumulators[key] {
                 acc.pids.append(pid)
@@ -377,6 +461,10 @@ final class ProcessTracker {
                 acc.uploadSpeed += speed.upload
                 acc.totalBytesIn = acc.totalBytesIn &+ state.sessionBytesIn
                 acc.totalBytesOut = acc.totalBytesOut &+ state.sessionBytesOut
+                acc.internetDownloadSpeed += netSpeed.download
+                acc.internetUploadSpeed += netSpeed.upload
+                acc.internetBytesIn = acc.internetBytesIn &+ state.internetSessionBytesIn
+                acc.internetBytesOut = acc.internetBytesOut &+ state.internetSessionBytesOut
                 acc.launchedFromTerminal = acc.launchedFromTerminal || state.identity.launchedFromTerminal
                 foldConnections(into: &acc, pid: pid)
                 accumulators[key] = acc
@@ -390,6 +478,10 @@ final class ProcessTracker {
                     uploadSpeed: speed.upload,
                     totalBytesIn: state.sessionBytesIn,
                     totalBytesOut: state.sessionBytesOut,
+                    internetDownloadSpeed: netSpeed.download,
+                    internetUploadSpeed: netSpeed.upload,
+                    internetBytesIn: state.internetSessionBytesIn,
+                    internetBytesOut: state.internetSessionBytesOut,
                     launchedFromTerminal: state.identity.launchedFromTerminal
                 )
                 foldConnections(into: &acc, pid: pid)
@@ -424,7 +516,11 @@ final class ProcessTracker {
                 origin: origin,
                 trust: trust,
                 connections: materializeConnections(acc.connAgg),
-                launchedFromTerminal: acc.launchedFromTerminal
+                launchedFromTerminal: acc.launchedFromTerminal,
+                internetDownloadSpeed: acc.internetDownloadSpeed,
+                internetUploadSpeed: acc.internetUploadSpeed,
+                internetBytesIn: acc.internetBytesIn,
+                internetBytesOut: acc.internetBytesOut
             )
         }
     }

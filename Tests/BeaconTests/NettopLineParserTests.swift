@@ -84,6 +84,15 @@ final class NettopLineParserTests: XCTestCase {
         XCTAssertEqual(c.remotePort, 5223)
         XCTAssertEqual(c.bytesIn, 29316)
         XCTAssertEqual(c.bytesOut, 292993)
+        XCTAssertEqual(c.interface, "utun4")
+    }
+
+    func test_connection_blankInterface_isEmpty() {
+        let line = "12:00:00.0,udp4 *:5353<->*:*,,,10,20,,,,,786896,,CTL,,,,,,,so,"
+        guard case .connection(let c)? = NettopLineParser.parseRow(line: line) else {
+            return XCTFail("expected connection row")
+        }
+        XCTAssertEqual(c.interface, "")
     }
 
     func test_tcp6Connection_parsesAddressWithColons() {

@@ -35,6 +35,27 @@ struct AppNetworkUsage: Identifiable, Equatable {
     /// the "Terminal" chip in the row. Live-only — not persisted.
     let launchedFromTerminal: Bool
 
+    /// Internet-only slice of the speeds / session bytes above — everything
+    /// except flows `TrafficClassifier` tags local (loopback, LAN, AirDrop,
+    /// multicast). Always ≤ the all-traffic counterpart.
+    var internetDownloadSpeed: Double = 0
+    var internetUploadSpeed: Double = 0
+    var internetBytesIn: UInt64 = 0
+    var internetBytesOut: UInt64 = 0
+
+    func downloadSpeed(in scope: TrafficScope) -> Double {
+        scope == .internet ? internetDownloadSpeed : downloadSpeed
+    }
+
+    func uploadSpeed(in scope: TrafficScope) -> Double {
+        scope == .internet ? internetUploadSpeed : uploadSpeed
+    }
+
+    /// Same 128 B/s threshold as `isActive`, applied to the scoped speed.
+    func isActive(in scope: TrafficScope) -> Bool {
+        (downloadSpeed(in: scope) + uploadSpeed(in: scope)) >= 128
+    }
+
     /// Convenience: is this app actively moving bytes right now?
     /// 128 B/s threshold cuts socket keepalive noise but still catches any
     /// daemon doing real work — previously was 1 KB/s which routinely hid

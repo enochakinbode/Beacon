@@ -69,11 +69,12 @@ struct PopoverRootView: View {
             listOrSearchResults
         }
         .frame(width: 380)
-        // Top-anchor the content so an empty search result doesn't visually
-        // re-center the header — when the inner VStack is shorter than the
-        // min height, the unused space sits at the bottom, not above the
-        // header.
-        .frame(minHeight: 220, maxHeight: 560, alignment: .top)
+        // Fixed height (not a min/max range) so the popover always opens at
+        // full size — with a range, the hosting controller sized to the
+        // list's content and the popover came up short when the list was
+        // short. Top-anchored so a short list or empty search result
+        // leaves the unused space at the bottom, not above the header.
+        .frame(height: 448, alignment: .top)
         .onAppear { installAutoSearchMonitor() }
         .onChange(of: searchQuery) { _ in scheduleSettleDebounce() }
         // The global ⌥B shortcut posts this when it opens the popover, so the
@@ -141,7 +142,7 @@ struct PopoverRootView: View {
         HStack(spacing: 12) {
             HStack(spacing: 14) {
                 Label {
-                    Text(FormatUtility.formatSpeed(viewModel.currentSpeed.downloadSpeed))
+                    Text(FormatUtility.formatSpeed(viewModel.scopedSpeed.downloadSpeed))
                         .font(.system(size: 13, weight: .medium))
                 } icon: {
                     Image(systemName: "arrow.down")
@@ -149,7 +150,7 @@ struct PopoverRootView: View {
                         .foregroundColor(.primary)
                 }
                 Label {
-                    Text(FormatUtility.formatSpeed(viewModel.currentSpeed.uploadSpeed))
+                    Text(FormatUtility.formatSpeed(viewModel.scopedSpeed.uploadSpeed))
                         .font(.system(size: 13, weight: .medium))
                 } icon: {
                     Image(systemName: "arrow.up")
@@ -158,6 +159,7 @@ struct PopoverRootView: View {
                 }
             }
             Spacer()
+            ScopeMenuButton(scope: viewModel.scope) { viewModel.scope = $0 }
             activeCountBadge
             HeaderMenuButton(onQuit: onQuit, onResetAllTime: onResetAllTime)
         }
@@ -273,8 +275,12 @@ struct PopoverRootView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if rows.isEmpty {
                     emptyRow(filterActiveOnly
-                        ? "No apps are actively using the network"
-                        : "No network activity recorded yet")
+                        ? (viewModel.scope == .internet
+                            ? "No apps are actively using the internet"
+                            : "No apps are actively using the network")
+                        : (viewModel.scope == .internet
+                            ? "No internet activity recorded yet"
+                            : "No network activity recorded yet"))
                 } else {
                     ForEach(rows) { entry in
                         rowView(for: entry, active: active, liveById: liveById, matchChip: nil)
@@ -293,6 +299,7 @@ struct PopoverRootView: View {
                           matchChip: MatchChip?) -> some View {
         LifetimeRowView(
             entry: entry,
+            scope: viewModel.scope,
             isActive: active.contains(entry.id),
             live: liveById[entry.id],
             isIgnored: ignored.isIgnored(entry.id),
@@ -306,7 +313,10 @@ struct PopoverRootView: View {
                     ignored.ignore(entry.id, displayName: entry.displayName)
                 }
             },
-            onResetAll: { lifetime.resetAll() },
+            onResetAll: {
+                lifetime.resetAll()
+                DailyUsageStore.shared.resetAll()
+            },
             onPrimaryTap: { handlePrimaryTap(entry) },
             onEnterMultiSelect: { enterMultiSelect(seed: entry) },
             onHideSelected: { hideSelected() },
@@ -356,12 +366,15 @@ struct PopoverRootView: View {
     }
 
     /// One-pass build: filter ignored, drop zero-byte rows, optional
-    /// active-only filter, sort by bytes desc. Zero-byte filter hides apps
-    /// that haven't transmitted any data yet — they're noise in the list.
+    /// active-only filter, sort by bytes desc — all measured in the current
+    /// scope. Zero-byte filter hides apps that haven't transmitted any data
+    /// yet (in Internet scope: apps whose traffic is all local) — they're
+    /// noise in the list.
     private func computeDisplayRows(active: Set<String>) -> [LifetimeUsage] {
         let ignoredIds = IgnoreListManager.shared.ignoredIds
+        let scope = viewModel.scope
         let filtered = lifetime.entries.values.filter { entry in
-            if entry.totalBytes == 0 { return false }
+            if entry.totalBytes(in: scope) == 0 { return false }
             if ignoredIds.contains(entry.id) { return false }
             if filterActiveOnly && !active.contains(entry.id) { return false }
             return true
@@ -371,7 +384,8 @@ struct PopoverRootView: View {
         // between ticks), so without a total order two apps with identical totals
         // would swap positions tick-to-tick — rows jittering under the cursor.
         return filtered.sorted {
-            $0.totalBytes != $1.totalBytes ? $0.totalBytes > $1.totalBytes : $0.id < $1.id
+            let a = $0.totalBytes(in: scope), b = $1.totalBytes(in: scope)
+            return a != b ? a > b : $0.id < $1.id
         }
     }
 
@@ -524,10 +538,12 @@ struct PopoverRootView: View {
         // list draws from), but DO NOT apply the active-only filter — the
         // user is searching across history, not the currently-active view.
         let ignoredIds = IgnoreListManager.shared.ignoredIds
+        let scope = viewModel.scope
         let sortedEntries = lifetime.entries.values
-            .filter { $0.totalBytes > 0 && !ignoredIds.contains($0.id) }
+            .filter { $0.totalBytes(in: scope) > 0 && !ignoredIds.contains($0.id) }
             .sorted {
-                $0.totalBytes != $1.totalBytes ? $0.totalBytes > $1.totalBytes : $0.id < $1.id
+                let a = $0.totalBytes(in: scope), b = $1.totalBytes(in: scope)
+                return a != b ? a > b : $0.id < $1.id
             }
 
         for entry in sortedEntries {
@@ -686,6 +702,8 @@ final class DebounceHolder {
 /// panel can flank-position itself when this row is clicked.
 struct LifetimeRowView: View {
     let entry: LifetimeUsage
+    /// Which byte counters / speeds the right-hand block shows.
+    let scope: TrafficScope
     let isActive: Bool
     /// Live snapshot looked up ONCE in the parent and passed down. Lets the
     /// parent batch all rows' lookups into a single queue.sync.
@@ -749,10 +767,10 @@ struct LifetimeRowView: View {
 
             // 3-line RIGHT block.
             VStack(alignment: .trailing, spacing: 2) {
-                Text(FormatUtility.formatBytes(entry.totalBytes))
+                Text(FormatUtility.formatBytes(entry.totalBytes(in: scope)))
                     .font(.system(size: 12, weight: .semibold))
 
-                Text("↓\(FormatUtility.formatBytes(entry.totalBytesIn))   ↑\(FormatUtility.formatBytes(entry.totalBytesOut))")
+                Text("↓\(FormatUtility.formatBytes(entry.bytesIn(in: scope)))   ↑\(FormatUtility.formatBytes(entry.bytesOut(in: scope)))")
                     .font(.system(size: 10))
                     .foregroundColor(.primary)
 
@@ -887,8 +905,8 @@ struct LifetimeRowView: View {
 
     @ViewBuilder
     private func currentSpeedLine(live: AppNetworkUsage?) -> some View {
-        if let live = live, (live.downloadSpeed + live.uploadSpeed) > 0 {
-            Text("↓\(FormatUtility.formatSpeed(live.downloadSpeed))  ↑\(FormatUtility.formatSpeed(live.uploadSpeed))")
+        if let live = live, (live.downloadSpeed(in: scope) + live.uploadSpeed(in: scope)) > 0 {
+            Text("↓\(FormatUtility.formatSpeed(live.downloadSpeed(in: scope)))  ↑\(FormatUtility.formatSpeed(live.uploadSpeed(in: scope)))")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundColor(.accentColor)
         } else {
@@ -921,6 +939,51 @@ struct LifetimeRowView: View {
         f.unitsStyle = .short
         return f
     }()
+}
+
+// MARK: - Scope Menu Button
+
+/// Internet / All Traffic dropdown in the header, beside the active count.
+/// Scopes the list, the search results, the header speeds and the active
+/// badge. Internet (the default) drops loopback, LAN, AirDrop and multicast
+/// traffic — see `TrafficClassifier`. Takes a plain value + callback rather
+/// than observing the view model, and its menu items are static, so the
+/// per-tick header re-render doesn't disturb an open menu (same reasoning as
+/// `HeaderMenuButton`).
+struct ScopeMenuButton: View {
+    let scope: TrafficScope
+    let onSelect: (TrafficScope) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(TrafficScope.allCases) { option in
+                Button {
+                    onSelect(option)
+                } label: {
+                    if option == scope {
+                        Label(option.label, systemImage: "checkmark")
+                    } else {
+                        Text(option.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(scope.label)
+                    .font(.system(size: 12, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundColor(.primary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.15)))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Internet excludes local traffic: this Mac, your LAN, AirDrop and other nearby devices")
+    }
 }
 
 // MARK: - Header Menu Button
