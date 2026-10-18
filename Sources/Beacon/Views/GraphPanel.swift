@@ -129,6 +129,9 @@ struct ExpandedGraphView: View {
     @State private var cachedSamples: [SpeedHistoryStore.Sample] = []
     @State private var cachedConnections: [AppConnection] = []
     @State private var cachedLive: AppNetworkUsage?
+    /// All-time row for this app — the ↓/↑ split of its total, shown in the
+    /// header (the popover row shows only the total).
+    @State private var cachedLifetime: LifetimeUsage?
     /// Which port rows the user has expanded to see remote-IP details. Keyed
     /// by `AppConnection.id` (e.g. `"tcp:443"`).
     @State private var expandedPorts: Set<String> = []
@@ -193,6 +196,8 @@ struct ExpandedGraphView: View {
         if newSamples != cachedSamples { cachedSamples = newSamples }
         let live = LatestSnapshotStore.shared.usage(forId: instance.appId)
         if live != cachedLive { cachedLive = live }
+        let lifetime = LifetimeUsageStore.shared.entries[instance.appId]
+        if lifetime != cachedLifetime { cachedLifetime = lifetime }
         let conns = live?.connections(in: scope) ?? []
         if conns != cachedConnections { cachedConnections = conns }
     }
@@ -269,6 +274,13 @@ struct ExpandedGraphView: View {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.green)
+                }
+                Spacer(minLength: 6)
+                if let lifetime = cachedLifetime {
+                    Text("Total ↓\(FormatUtility.formatBytes(lifetime.bytesIn(in: scope)))  ↑\(FormatUtility.formatBytes(lifetime.bytesOut(in: scope)))")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .help("All-time data received / sent")
                 }
             }
         }

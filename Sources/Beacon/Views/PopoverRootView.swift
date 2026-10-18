@@ -738,9 +738,6 @@ struct LifetimeRowView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                         .truncationMode(.tail)
-                    if let live = live {
-                        trustIcon(live.trust)
-                    }
                     if live?.launchedFromTerminal == true {
                         terminalChip
                     }
@@ -765,17 +762,16 @@ struct LifetimeRowView: View {
             }
             Spacer(minLength: 6)
 
-            // 3-line RIGHT block.
+            // RIGHT block: total + live speed. The ↓/↑ split of the total and
+            // the code-signature badge live in the chart panel a click opens.
             VStack(alignment: .trailing, spacing: 2) {
                 Text(FormatUtility.formatBytes(entry.totalBytes(in: scope)))
                     .font(.system(size: 12, weight: .semibold))
 
-                Text("↓\(FormatUtility.formatBytes(entry.bytesIn(in: scope)))   ↑\(FormatUtility.formatBytes(entry.bytesOut(in: scope)))")
-                    .font(.system(size: 10))
-                    .foregroundColor(.primary)
-
                 currentSpeedLine(live: live)
             }
+            // Sit the total slightly below the row's vertical center.
+            .padding(.top, 4)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -875,21 +871,6 @@ struct LifetimeRowView: View {
             .padding(.horizontal, 4)
             .padding(.vertical, 1)
             .background(RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.18)))
-    }
-
-    /// Code-signature trust icon.
-    private func trustIcon(_ trust: ProcessTrust) -> some View {
-        let color: Color = {
-            switch trust {
-            case .trusted:   return .green
-            case .untrusted: return .orange
-            case .unknown:   return .secondary
-            }
-        }()
-        return Image(systemName: trust.sfSymbol)
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundColor(color)
-            .help(trust.tooltip)
     }
 
     private func pidLine(live: AppNetworkUsage?) -> String {
