@@ -1477,7 +1477,8 @@ final class GraphPanelController: ObservableObject {
                 guard let self = self,
                       let transient = self.currentTransient() else { return event }
                 if self.isPoint(inPanel: NSEvent.mouseLocation) { return event }
-                if let win = event.window, win.className.contains("Popover") {
+                if let win = event.window, win.className.contains("Popover"),
+                   !Self.isHeaderMenuClick(event, in: win) {
                     self.close(transient, fromMonitor: true)
                 }
                 return event
@@ -1493,6 +1494,23 @@ final class GraphPanelController: ObservableObject {
                 self.close(transient, fromMonitor: false)
             }
         }
+    }
+
+    /// True when a popover click lands on one of the header's pull-down menus
+    /// (the Internet / All Traffic scope switch, the gear). Those don't shift
+    /// focus back to the list — switching scope is exactly when the open chart
+    /// should stay up and follow it — so they must not dismiss the transient
+    /// chart. SwiftUI backs `Menu` with an `NSPopUpButton`.
+    private static func isHeaderMenuClick(_ event: NSEvent, in window: NSWindow) -> Bool {
+        // The frame view fills the window, so window coordinates are what
+        // its hitTest (which takes superview coordinates) expects.
+        guard let frameView = window.contentView?.superview else { return false }
+        var view = frameView.hitTest(event.locationInWindow)
+        while let v = view {
+            if v is NSPopUpButton { return true }
+            view = v.superview
+        }
+        return false
     }
 
     private func tearDownCloseTriggers() {
