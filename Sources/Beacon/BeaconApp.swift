@@ -77,6 +77,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// the popover; the intermediate close fires popoverDidClose, which must NOT
     /// drop the gate hold mid-open. This flag tells the delegate to skip release.
     private var isShowingPopover = false
+    /// When an outside-click monitor last closed the popover. The status button
+    /// acts on mouse-UP, but the monitors fire on mouse-DOWN — so if the
+    /// mouse-down on the icon itself is ever treated as "outside" (status-bar
+    /// windows aren't always matched as ours), the popover closes and the
+    /// mouse-up toggle sees it closed and reopens it: a visible blink instead of
+    /// a close. A toggle arriving right after such a close is swallowed.
+    private var lastMonitorCloseAt: Date?
+    private static let monitorCloseDebounce: TimeInterval = 0.4
 
     /// Global ⌥B shortcut: toggles the popover from anywhere, always-wins,
     /// via a Carbon hot key (no Accessibility permission). See GlobalHotkey.
@@ -611,6 +619,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // full-screen transitions.
         if isPopoverActuallyVisible, popoverIsOnActiveSpace {
             closePopover()
+        } else if let closedAt = lastMonitorCloseAt,
+                  Date().timeIntervalSince(closedAt) < Self.monitorCloseDebounce {
+            // This click's own mouse-down already closed the popover via an
+            // outside-click monitor — the click meant "close", so stay closed.
+            lastMonitorCloseAt = nil
         } else {
             // Clear any wedged state (isShown stuck true, orphaned monitors,
             // stale cached window) so the open always starts from a clean slate.
@@ -910,7 +923,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if GraphPanelController.shared.isPoint(inPanel: NSEvent.mouseLocation) {
                 return
             }
-            self?.closePopover()
+            // A click on the status icon is the toggle's job (on mouse-up).
+            guard let self = self, !self.isPointInStatusButton(NSEvent.mouseLocation) else { return }
+            self.closePopoverFromMonitor()
         }
         // Local monitor: catches clicks INSIDE our own app's windows (other than
         // the popover content).
@@ -941,12 +956,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                event.window === statusWindow {
                 return event
             }
+            if self.isPointInStatusButton(NSEvent.mouseLocation) {
+                return event
+            }
             if GraphPanelController.shared.isPoint(inPanel: NSEvent.mouseLocation) {
                 return event
             }
-            self.closePopover()
+            self.closePopoverFromMonitor()
             return event
         }
+    }
+
+    private func closePopoverFromMonitor() {
+        lastMonitorCloseAt = Date()
+        closePopover()
+    }
+
+    /// Whether a screen point lies on the status-item button. Matched by
+    /// geometry rather than by window identity, which isn't reliable for
+    /// status-bar windows.
+    private func isPointInStatusButton(_ point: NSPoint) -> Bool {
+        guard let button = statusItem?.button, let window = button.window else { return false }
+        let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return rect.contains(point)
     }
 
     private func removeOutsideClickMonitor() {

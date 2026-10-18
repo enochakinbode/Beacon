@@ -140,7 +140,7 @@ struct PopoverRootView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 14) {
+            HStack(spacing: 8) {
                 Label {
                     Text(FormatUtility.formatSpeed(viewModel.scopedSpeed.downloadSpeed))
                         .font(.system(size: 13, weight: .medium))
