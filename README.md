@@ -32,7 +32,7 @@ A native macOS menu-bar utility that tells you, second by second, **which apps a
 ### Chart panel — click any row
 A floating panel opens beside the popover with a per-app history graph and a port/service breakdown.
 
-- **Date-range picker:** Live (1 min) / 5 min / 15 min / 1 hour / 24 hours / 7 days / 30 days.
+- **Today only:** the chart covers today, since local midnight.
 - **Trading-chart crosshair on hover** — dashed vertical at the snapped time + two horizontal guides (blue ↓, green ↑) reading off the y-axis, plus a floating value box.
 - **Port / service breakdown** under the chart: every service the app talks to (443 → https, 53 → dns, …) with ↓/↑ totals. Click a port to expand the distinct remote IPs behind it.
 - **Resizable** graph / port-service split with a draggable divider, and a **movable, resizable window**.
@@ -46,7 +46,7 @@ Beacon spawns `/usr/bin/nettop -n -L 1` once per second (in the `C` locale for s
 
 Why per-cycle and not one long-lived `nettop`? In interactive mode `nettop` emits ncurses escape codes, not CSV; and when its stdout is a pipe it **block-buffers** and only flushes on exit — so a long-lived process delivers nothing for ~60 seconds. `-L 1` produces one snapshot and exits in ~60 ms, and we pace the loop ourselves at ~1 Hz. Idle CPU stays near 0%.
 
-Code signatures are validated once per bundle path via `SecStaticCodeCheckValidity` and cached. All-time byte counts live in `~/Library/Application Support/Beacon/lifetime.json` (saved every 30 s and on quit). Speed history is tiered: 1 Hz samples for the last hour in memory, per-minute averages for 24 hours, and per-hour averages for 30 days — the averaged tiers persisted to `speed-history.json`.
+Code signatures are validated once per bundle path via `SecStaticCodeCheckValidity` and cached. All-time byte counts live in `~/Library/Application Support/Beacon/lifetime.json` (saved every 30 s and on quit). Speed history is per-minute averages for the last 24 hours, persisted to `speed-history.json`.
 
 ---
 
@@ -143,7 +143,7 @@ beacon/
 
 ## Known limits
 
-- **Downsampled long-range history.** Raw 1 Hz for the last hour, per-minute for 24 h, per-hour for 30 days — a 30-day view shows hourly means, not raw samples.
+- **Per-minute chart.** The chart plots per-minute averages, not raw 1 Hz samples.
 - **No retroactive counters.** macOS doesn't expose per-process bytes counted before the app launched, so All-Time totals only include traffic observed *while Beacon was running*.
 - **Cold-start cost.** The first snapshot validates each running binary's signature — expect a brief ~0.3–1 s CPU blip, then idle.
 - **Not in the Mac App Store.** The sandbox blocks `nettop`; see [Requirements](#requirements).

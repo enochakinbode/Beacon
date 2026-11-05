@@ -1,25 +1,15 @@
 import Foundation
 
-/// Per-app rolling time-series of (download, upload) speed, kept at three
-/// resolutions so we can show anything from "last minute" to "last 30 days"
-/// without holding millions of samples.
-///
-/// Why tiered (round-robin database style): 30 days of raw 1 Hz samples is
-/// ~2.6M points *per app* — gigabytes once you have dozens of apps. Instead we
-/// keep:
-///
-///   • raw    — 1 Hz samples, last 1 hour (3600), in-memory only
-///   • minute — per-minute averages, last 24 hours (1440), persisted to disk
-///   • hour   — per-hour  averages, last 30 days  (720),  persisted to disk
-///
-/// The graph picks the finest tier that still covers the requested range, so a
-/// "Last 5 min" view is smooth (raw) while "Last 30 days" stays cheap (hourly).
-/// Persisted footprint is ~70 KB per app; the raw tier is regenerated on launch.
+/// Per-app time-series of (download, upload) speed for the app chart, which
+/// shows today only: per-minute averages, last 24 hours (1440 buckets),
+/// persisted to disk. Nothing older than a day is kept. (Earlier builds also
+/// kept a 1 Hz in-memory tier and a 30-day per-hour tier; an old file's `hour`
+/// key is ignored and dropped on the next save.)
 final class SpeedHistoryStore {
     static let shared = SpeedHistoryStore()
 
     /// `down` / `up` are all-traffic speeds; `netDown` / `netUp` the
-    /// internet-only slice. `series(forId:range:scope:)` returns samples whose
+    /// internet-only slice. `series(forId:scope:)` returns samples whose
     /// `down` / `up` already hold the requested scope's values, so chart code
     /// never has to pick.
     struct Sample: Equatable {
@@ -36,14 +26,7 @@ final class SpeedHistoryStore {
         }
     }
 
-    /// Which stored tier a query should read from.
-    enum Resolution { case raw, minute, hour }
-
-    // MARK: - Tiers
-
-    /// Raw 1 Hz, last hour. In-memory only (cheap to rebuild, large to persist).
-    private var raw: [String: [Sample]] = [:]
-    private let rawCap = 3600
+    // MARK: - Buckets
 
     /// Averaged bucket: sum + count so we can compute the mean speed over the
     /// bucket's window. `internal` (not `private`) so the pure append logic can be
@@ -68,13 +51,10 @@ final class SpeedHistoryStore {
     }
 
     private var minute: [String: [Bucket]] = [:]
-    private var hour: [String: [Bucket]] = [:]
     private let minuteCap = 1440     // 24 h × 60
-    private let hourCap = 720        // 30 d × 24
 
     private let secondsPerMinute: TimeInterval = 60
-    private let secondsPerHour: TimeInterval = 3600
-    private let thirtyDays: TimeInterval = 30 * 24 * 3600
+    private let oneDay: TimeInterval = 24 * 3600
 
     // MARK: - Persistence
 
@@ -99,7 +79,6 @@ final class SpeedHistoryStore {
 
     private struct Persisted: Codable {
         var minute: [String: [Bucket]]
-        var hour: [String: [Bucket]]
     }
 
     private init() {
@@ -128,42 +107,19 @@ final class SpeedHistoryStore {
     func ingest(_ apps: [AppNetworkUsage]) {
         let now = Date()
         let minuteStart = floor(now, to: secondsPerMinute)
-        let hourStart = floor(now, to: secondsPerHour)
-        // Fold windows scale with each tier's bucket width (2× the resolution): a
-        // backward clock step smaller than this folds losslessly into the current
-        // bucket; a larger one rebases so the chart can't freeze. Computed here,
-        // outside the async body, so the tier constants don't need `self.` inside.
+        // Fold window = 2× the bucket width: a backward clock step smaller than
+        // this folds losslessly into the current bucket; a larger one rebases so
+        // the chart can't freeze. Computed here, outside the async body, so the
+        // tier constant doesn't need `self.` inside.
         let minuteFold = 2 * secondsPerMinute
-        let hourFold = 2 * secondsPerHour
         queue.async(flags: .barrier) {
             for app in apps {
-                // Tier 1 — raw ring.
-                var r = self.raw[app.id] ?? []
-                r.append(Sample(t: now, down: app.downloadSpeed, up: app.uploadSpeed,
-                                netDown: app.internetDownloadSpeed, netUp: app.internetUploadSpeed))
-                if r.count > self.rawCap { r.removeFirst(r.count - self.rawCap) }
-                self.raw[app.id] = r
-
-                // Tier 2 — minute buckets.
                 self.accumulate(
                     into: &self.minute, id: app.id, bucketStart: minuteStart,
                     down: app.downloadSpeed, up: app.uploadSpeed,
                     netDown: app.internetDownloadSpeed, netUp: app.internetUploadSpeed,
                     cap: self.minuteCap,
                     foldWindow: minuteFold
-                )
-                // Tier 3 — hour buckets. Without a tier-scaled fold window the
-                // default (120 s, tuned for 60 s minute buckets) would rebase — and
-                // drop the accumulating partial hour — on any backward step that
-                // merely crosses an hour boundary (e.g. a few-second NTP nudge near
-                // :00). The 2 h window folds those and rebases only on a truly large
-                // (multi-hour) jump.
-                self.accumulate(
-                    into: &self.hour, id: app.id, bucketStart: hourStart,
-                    down: app.downloadSpeed, up: app.uploadSpeed,
-                    netDown: app.internetDownloadSpeed, netUp: app.internetUploadSpeed,
-                    cap: self.hourCap,
-                    foldWindow: hourFold
                 )
             }
             self.generation &+= 1
@@ -242,49 +198,15 @@ final class SpeedHistoryStore {
         return Date(timeIntervalSince1970: (t / seconds).rounded(.down) * seconds)
     }
 
-    /// Bucket-mean decimation to ≤ `target` points. "Last 1 hour" reads the raw
-    /// tier — 3600 samples → 7200 LineMarks across the two series — and Charts
-    /// re-lays-out every mark on every 1 Hz tick, a measurable main-thread cost
-    /// per open panel. ~720 points is denser than any panel is wide, so nothing
-    /// visible is lost; averaging matches what the minute/hour tiers already do.
-    /// Ranges that fit under `target` pass through untouched.
-    private static func downsample(_ samples: [Sample], target: Int) -> [Sample] {
-        guard samples.count > target, target > 0 else { return samples }
-        let stride = Int((Double(samples.count) / Double(target)).rounded(.up))
-        var out: [Sample] = []
-        out.reserveCapacity(samples.count / stride + 1)
-        var i = 0
-        while i < samples.count {
-            let chunk = samples[i..<min(i + stride, samples.count)]
-            let n = Double(chunk.count)
-            out.append(Sample(
-                t: chunk[chunk.startIndex].t,
-                down: chunk.reduce(0) { $0 + $1.down } / n,
-                up: chunk.reduce(0) { $0 + $1.up } / n,
-                netDown: chunk.reduce(0) { $0 + $1.netDown } / n,
-                netUp: chunk.reduce(0) { $0 + $1.netUp } / n
-            ))
-            i += stride
-        }
-        return out
-    }
-
     // MARK: - Query
 
-    /// Time-series for one app over `range`, at the appropriate resolution,
-    /// with `down` / `up` holding `scope`'s speeds (see `Sample.scoped`).
-    /// Empty if we have no data for that id/range yet.
-    func series(forId id: String, range: GraphTimeRange, scope: TrafficScope = .all) -> [Sample] {
+    /// Today's per-minute series for one app (since local midnight), with
+    /// `down` / `up` holding `scope`'s speeds (see `Sample.scoped`). Empty if
+    /// we have no data for that id today yet.
+    func series(forId id: String, scope: TrafficScope = .all, now: Date = Date()) -> [Sample] {
+        let cutoff = Calendar.current.startOfDay(for: now)
         let samples: [Sample] = queue.sync {
-            let cutoff = Date().addingTimeInterval(-range.seconds)
-            switch range.resolution {
-            case .raw:
-                return Self.downsample((raw[id] ?? []).filter { $0.t >= cutoff }, target: 720)
-            case .minute:
-                return (minute[id] ?? []).filter { $0.start >= cutoff }.map(\.sample)
-            case .hour:
-                return (hour[id] ?? []).filter { $0.start >= cutoff }.map(\.sample)
-            }
+            (minute[id] ?? []).filter { $0.start >= cutoff }.map(\.sample)
         }
         return scope == .all ? samples : samples.map { $0.scoped(scope) }
     }
@@ -296,9 +218,8 @@ final class SpeedHistoryStore {
         guard let decoded = try? JSONDecoder().decode(Persisted.self, from: data) else {
             // File exists but didn't decode — corrupt/truncated. Move it aside
             // so the next save doesn't silently overwrite recoverable history
-            // with an empty store. History is non-critical (raw tier rebuilds
-            // live), but a `.corrupt` copy aids diagnosis and avoids a quiet
-            // data loss.
+            // with an empty store. History is non-critical, but a `.corrupt`
+            // copy aids diagnosis and avoids a quiet data loss.
             let backup = storeURL.appendingPathExtension("corrupt")
             try? FileManager.default.removeItem(at: backup)
             try? FileManager.default.moveItem(at: storeURL, to: backup)
@@ -307,8 +228,7 @@ final class SpeedHistoryStore {
         // Drop anything already past its retention window (e.g. the app was
         // closed for a week) so we don't show stale gaps.
         let now = Date()
-        minute = decoded.minute.mapValues { $0.filter { now.timeIntervalSince($0.start) <= 24 * 3600 } }
-        hour = decoded.hour.mapValues { $0.filter { now.timeIntervalSince($0.start) <= self.thirtyDays } }
+        minute = decoded.minute.mapValues { $0.filter { now.timeIntervalSince($0.start) <= self.oneDay } }
         pruneEmptyAndDeadApps(now: now)
     }
 
@@ -325,7 +245,7 @@ final class SpeedHistoryStore {
             self.queue.sync(flags: .barrier) {
                 guard self.generation != self.savedGeneration else { return }
                 self.pruneEmptyAndDeadApps(now: Date())
-                payload = Persisted(minute: self.minute, hour: self.hour)
+                payload = Persisted(minute: self.minute)
                 gen = self.generation
             }
             guard let snapshot = payload else { return }
@@ -336,36 +256,12 @@ final class SpeedHistoryStore {
         timer.resume()
     }
 
-    /// Tiered eviction:
-    ///   * Apps with no hour samples in 30 days are dropped entirely (the
-    ///     existing key-set cap).
-    ///   * Apps with stale RAW samples (newest > 10 min old) have their raw
-    ///     buffer cleared so quiet apps stop carrying 60 stale points each.
-    ///   * Apps with stale MINUTE samples (newest > 24h old) have their
-    ///     minute buffer cleared.
-    /// The hour tier is the long-term store; quiet apps keep their hour data
-    /// until they cross the 30-day line.
+    /// Eviction: apps whose newest minute bucket is over 24h old (or that
+    /// have none) are dropped. Nothing outlives a day.
     private func pruneEmptyAndDeadApps(now: Date) {
-        let oneDay: TimeInterval = 86_400
-        let tenMin: TimeInterval = 600
-        let dead = hour.compactMap { (id, buckets) -> String? in
-            guard let last = buckets.last else { return id }   // no buckets → dead
-            return now.timeIntervalSince(last.start) > thirtyDays ? id : nil
-        }
-        for id in dead {
-            hour[id] = nil
-            minute[id] = nil
-            raw[id] = nil
-        }
-        for (id, arr) in raw {
-            if let last = arr.last, now.timeIntervalSince(last.t) > tenMin {
-                raw[id] = nil
-            }
-        }
         for (id, arr) in minute {
-            if let last = arr.last, now.timeIntervalSince(last.start) > oneDay {
-                minute[id] = nil
-            }
+            if let last = arr.last, now.timeIntervalSince(last.start) <= oneDay { continue }
+            minute[id] = nil
         }
     }
 
@@ -378,7 +274,7 @@ final class SpeedHistoryStore {
         var gen: UInt64 = 0
         queue.sync(flags: .barrier) {
             guard generation != savedGeneration else { return }
-            payload = Persisted(minute: minute, hour: hour)
+            payload = Persisted(minute: minute)
             gen = generation
         }
         guard let snapshot = payload else { return }

@@ -3,50 +3,6 @@ import AppKit
 import Charts
 import Combine
 
-// MARK: - Time Range
-
-enum GraphTimeRange: String, CaseIterable, Identifiable {
-    case live = "Live (1 min)"
-    case fiveMin = "Last 5 min"
-    case fifteenMin = "Last 15 min"
-    case oneHour = "Last 1 hour"
-    case oneDay = "Last 24 hours"
-    case sevenDays = "Last 7 days"
-    case thirtyDays = "Last 30 days"
-
-    var id: String { rawValue }
-
-    var seconds: TimeInterval {
-        switch self {
-        case .live:       return 60
-        case .fiveMin:    return 300
-        case .fifteenMin: return 900
-        case .oneHour:    return 3600
-        case .oneDay:     return 86_400
-        case .sevenDays:  return 604_800
-        case .thirtyDays: return 2_592_000
-        }
-    }
-
-    /// Finest stored tier that still covers this range cheaply.
-    var resolution: SpeedHistoryStore.Resolution {
-        switch self {
-        case .live, .fiveMin, .fifteenMin, .oneHour: return .raw
-        case .oneDay:                                return .minute
-        case .sevenDays, .thirtyDays:               return .hour
-        }
-    }
-
-    /// True for day-scale ranges where the x-axis should show calendar dates
-    /// rather than clock times.
-    var isLongRange: Bool {
-        switch self {
-        case .oneDay, .sevenDays, .thirtyDays: return true
-        default: return false
-        }
-    }
-}
-
 // MARK: - Live Clock
 
 /// Single 1 Hz broadcaster all open chart panels subscribe to. With N pinned
@@ -123,24 +79,22 @@ struct ExpandedGraphView: View {
     /// can drop the instance from its bookkeeping.
     let onClose: () -> Void
 
-    @State private var range: GraphTimeRange
     /// Hoisted out of body so a drag-induced re-render never re-fetches.
-    /// Refreshed only when the tick / range / appId changes.
+    /// Refreshed only when the tick / scope / appId changes.
     @State private var cachedSamples: [SpeedHistoryStore.Sample] = []
     @State private var cachedConnections: [AppConnection] = []
     @State private var cachedLive: AppNetworkUsage?
-    /// All-time row for this app — the ↓/↑ split of its total, shown in the
-    /// header (the popover row shows only the total).
+    /// This app's lifetime row, read for today's ↓/↑ split shown in the header
+    /// (the popover row shows only the total).
     @State private var cachedLifetime: LifetimeUsage?
     /// Which port rows the user has expanded to see remote-IP details. Keyed
     /// by `AppConnection.id` (e.g. `"tcp:443"`).
     @State private var expandedPorts: Set<String> = []
 
-    init(instance: GraphPanelInstance, initialRange: GraphTimeRange, onTogglePin: @escaping () -> Void, onClose: @escaping () -> Void) {
+    init(instance: GraphPanelInstance, onTogglePin: @escaping () -> Void, onClose: @escaping () -> Void) {
         self.instance = instance
         self.onTogglePin = onTogglePin
         self.onClose = onClose
-        self._range = State(initialValue: initialRange)
     }
 
     var body: some View {
@@ -180,19 +134,18 @@ struct ExpandedGraphView: View {
             refreshCaches()
         }
         .onDisappear { LiveClock.shared.release() }
-        // Refresh sample cache on each tick AND on range changes. The drag
+        // Refresh sample cache on each tick AND on scope changes. The drag
         // gesture in the split divider doesn't touch this — only the
         // .frame(height:) modifiers downstream — so the chart isn't rebuilt
         // while resizing.
         .onReceive(LiveClock.shared.$now) { _ in refreshCaches() }
-        .onChange(of: range) { _ in refreshCaches() }
         .onChange(of: scopeSetting.scope) { _ in refreshCaches() }
     }
 
     private var scope: TrafficScope { scopeSetting.scope }
 
     private func refreshCaches() {
-        let newSamples = SpeedHistoryStore.shared.series(forId: instance.appId, range: range, scope: scope)
+        let newSamples = SpeedHistoryStore.shared.series(forId: instance.appId, scope: scope)
         if newSamples != cachedSamples { cachedSamples = newSamples }
         let live = LatestSnapshotStore.shared.usage(forId: instance.appId)
         if live != cachedLive { cachedLive = live }
@@ -208,7 +161,7 @@ struct ExpandedGraphView: View {
         let live = cachedLive
         let active = live?.isActive(in: scope) ?? false
         return VStack(alignment: .leading, spacing: 4) {
-            // Row 1: activity dot · name · trust · timeframe · pin · close
+            // Row 1: activity dot · name · trust · pin · close
             HStack(spacing: 8) {
                 ActivityDot(isActive: active)
                 Text(instance.displayName)
@@ -219,14 +172,6 @@ struct ExpandedGraphView: View {
                     trustIcon(live.trust)
                 }
                 Spacer(minLength: 6)
-                Picker("", selection: $range) {
-                    ForEach(GraphTimeRange.allCases) { r in
-                        Text(r.rawValue).tag(r)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .frame(width: 140)
                 pinButton
                 if instance.pinned { closeButton }
             }
@@ -277,10 +222,11 @@ struct ExpandedGraphView: View {
                 }
                 Spacer(minLength: 6)
                 if let lifetime = cachedLifetime {
-                    Text("Total ↓\(FormatUtility.formatBytes(lifetime.bytesIn(in: scope)))  ↑\(FormatUtility.formatBytes(lifetime.bytesOut(in: scope)))")
+                    let day = LifetimeUsage.dayKey()
+                    Text("Today ↓\(FormatUtility.formatBytes(lifetime.todayBytesIn(in: scope, day: day)))  ↑\(FormatUtility.formatBytes(lifetime.todayBytesOut(in: scope, day: day)))")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
-                        .help("All-time data received / sent")
+                        .help("Data received / sent today")
                 }
             }
         }
@@ -351,7 +297,7 @@ struct ExpandedGraphView: View {
     private var chartSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             if cachedSamples.isEmpty {
-                Text("No history yet for this range — wait a moment.")
+                Text("No activity recorded today yet — wait a moment.")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -361,7 +307,7 @@ struct ExpandedGraphView: View {
                 // every mouse-moved tick. `.equatable()` makes SwiftUI skip
                 // this subtree's body on parent re-renders triggered by the
                 // divider drag (data unchanged → skip).
-                ChartCanvas(samples: cachedSamples, range: range)
+                ChartCanvas(samples: cachedSamples)
                     .equatable()
                 HStack(spacing: 14) {
                     Label("Download", systemImage: "arrow.down.circle.fill")
@@ -437,7 +383,6 @@ struct ExpandedGraphView: View {
 /// here, not compared by `==`), so the crosshair stays responsive.
 private struct ChartCanvas: View, Equatable {
     let samples: [SpeedHistoryStore.Sample]
-    let range: GraphTimeRange
 
     /// Snapped sample under the cursor. Local to this view. Updates dedup
     /// against the previous value so identical positions don't trigger
@@ -447,14 +392,13 @@ private struct ChartCanvas: View, Equatable {
     static func == (lhs: ChartCanvas, rhs: ChartCanvas) -> Bool {
         // Array equality on a few hundred samples would be O(N) on every
         // parent diff. Cheap surrogate: same length + same head/tail
-        // timestamp + same tail *magnitude*. The magnitude check matters for
-        // the minute/hour tiers: there the last bucket's `start` timestamp
-        // stays fixed for 60s/3600s while its running average changes every
+        // timestamp + same tail *magnitude*. The magnitude check matters
+        // because the last minute bucket's `start` timestamp stays fixed for
+        // 60s while its running average changes every
         // tick — comparing only timestamps would skip the redraw and freeze
         // the live point until the bucket rolled over. A divider drag changes
         // neither timestamp nor magnitude, so it still skips correctly.
-        lhs.range == rhs.range
-            && lhs.samples.count == rhs.samples.count
+        lhs.samples.count == rhs.samples.count
             && lhs.samples.last?.t == rhs.samples.last?.t
             && lhs.samples.first?.t == rhs.samples.first?.t
             && lhs.samples.last?.down == rhs.samples.last?.down
@@ -493,7 +437,7 @@ private struct ChartCanvas: View, Equatable {
             }
         }
         .chartOverlay { proxy in
-            CrosshairOverlay(samples: samples, hoverSample: $hoverSample, proxy: proxy, range: range)
+            CrosshairOverlay(samples: samples, hoverSample: $hoverSample, proxy: proxy)
         }
         // Pin the y-axis to a zero baseline. Two reasons: (1) an all-zero / flat
         // series (a freshly-tracked idle app) would otherwise hand Swift Charts a
@@ -514,13 +458,8 @@ private struct ChartCanvas: View, Equatable {
         }
         .chartXAxis {
             AxisMarks(values: .automatic(desiredCount: 4)) { _ in
-                if range.isLongRange {
-                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
-                        .font(.system(size: 9))
-                } else {
-                    AxisValueLabel(format: .dateTime.hour().minute())
-                        .font(.system(size: 9))
-                }
+                AxisValueLabel(format: .dateTime.hour().minute())
+                    .font(.system(size: 9))
                 AxisGridLine()
             }
         }
@@ -538,9 +477,6 @@ private struct CrosshairOverlay: View {
     let samples: [SpeedHistoryStore.Sample]
     @Binding var hoverSample: SpeedHistoryStore.Sample?
     let proxy: ChartProxy
-    /// Drives the hover label's timestamp format: day-scale ranges show a
-    /// calendar date (seconds are meaningless on an hourly-bucketed chart).
-    let range: GraphTimeRange
 
     var body: some View {
         GeometryReader { geo in
@@ -615,18 +551,11 @@ private struct CrosshairOverlay: View {
     @ViewBuilder
     private func crosshairLabel(sample s: SpeedHistoryStore.Sample) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            Group {
-                if range.isLongRange {
-                    // 7d / 30d / 24h read from hourly/minute buckets — show the
-                    // calendar date + time, not a spurious :SS that's always :00.
-                    Text(s.t, format: .dateTime.month(.abbreviated).day().hour().minute())
-                } else {
-                    Text(s.t, format: .dateTime.hour().minute().second())
-                }
-            }
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundColor(.primary)
-            .monospacedDigit()
+            // Minute buckets — no spurious :SS that's always :00.
+            Text(s.t, format: .dateTime.hour().minute())
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.primary)
+                .monospacedDigit()
             Text("↓ " + FormatUtility.formatSpeed(s.down))
                 .font(.system(size: 9))
                 .foregroundColor(.blue)
@@ -1237,8 +1166,7 @@ final class GraphPanelController: ObservableObject {
     ///   3. Otherwise → replace any existing transient with a new one for this app.
     func show(appId: String,
               displayName: String,
-              nearRowFrame: CGRect,
-              initialRange: GraphTimeRange = .live) {
+              nearRowFrame: CGRect) {
         // Same-row toggle dedup. If the popover-click monitor closed a
         // transient for THIS app within the last 100ms, the user almost
         // certainly just clicked the same row that triggered the monitor
@@ -1264,7 +1192,7 @@ final class GraphPanelController: ObservableObject {
         if let transient = currentTransient() {
             close(transient)
         }
-        let instance = makeInstance(appId: appId, displayName: displayName, initialRange: initialRange)
+        let instance = makeInstance(appId: appId, displayName: displayName)
         positionPanel(instance.panel, near: nearRowFrame)
         instance.panel.orderFront(nil)
         instances.append(instance)
@@ -1354,7 +1282,7 @@ final class GraphPanelController: ObservableObject {
         return instances.first { $0.id == id }
     }
 
-    private func makeInstance(appId: String, displayName: String, initialRange: GraphTimeRange) -> GraphPanelInstance {
+    private func makeInstance(appId: String, displayName: String) -> GraphPanelInstance {
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 540),
             styleMask: [.titled, .resizable, .nonactivatingPanel, .fullSizeContentView],
@@ -1365,7 +1293,6 @@ final class GraphPanelController: ObservableObject {
 
         let view = ExpandedGraphView(
             instance: instance,
-            initialRange: initialRange,
             onTogglePin: { [weak self, weak instance] in
                 guard let self = self, let instance = instance else { return }
                 self.togglePin(instance)

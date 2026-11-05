@@ -19,19 +19,21 @@ enum TrafficScope: String, CaseIterable, Identifiable {
 }
 
 /// The app-wide scope choice, shared by the popover (via `NetworkViewModel`)
-/// and the floating chart panels. Defaults to `.internet`; persisted in
-/// UserDefaults so the last choice survives relaunch. Main-thread only.
+/// and the floating chart panels. Set by the "Show All Traffic" toggle in the
+/// gear menu, off (`.internet`) by default; persisted in UserDefaults so the
+/// choice survives relaunch. Main-thread only.
 final class TrafficScopeSetting: ObservableObject {
     static let shared = TrafficScopeSetting()
-    private static let defaultsKey = "computer.lighthouse.beacon.trafficScope"
+    /// New key for the settings toggle, so everyone starts with it off — the
+    /// old header picker's saved choice (`…trafficScope`) is ignored.
+    private static let defaultsKey = "computer.lighthouse.beacon.showAllTraffic"
 
     @Published var scope: TrafficScope {
-        didSet { UserDefaults.standard.set(scope.rawValue, forKey: Self.defaultsKey) }
+        didSet { UserDefaults.standard.set(scope == .all, forKey: Self.defaultsKey) }
     }
 
     private init() {
-        let raw = UserDefaults.standard.string(forKey: Self.defaultsKey)
-        scope = raw.flatMap(TrafficScope.init(rawValue:)) ?? .internet
+        scope = UserDefaults.standard.bool(forKey: Self.defaultsKey) ? .all : .internet
     }
 }
 

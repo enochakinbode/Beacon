@@ -1,20 +1,43 @@
 import Foundation
 
-/// Internet bytes moved on one local calendar day, across every process.
+/// Bytes moved on one local calendar day, across every process.
 struct DayUsage: Codable, Equatable {
     /// Local-calendar day key, `yyyy-MM-dd`.
     let day: String
     var internetBytesIn: UInt64
     var internetBytesOut: UInt64
+    /// All traffic, internet + local. Added after the internet split, so days
+    /// saved by older builds decode as 0 (see `init(from:)`).
+    var allBytesIn: UInt64 = 0
+    var allBytesOut: UInt64 = 0
 
     var internetBytes: UInt64 { saturatingAdd(internetBytesIn, internetBytesOut) }
+    var allBytes: UInt64 { saturatingAdd(allBytesIn, allBytesOut) }
+
+    func bytesIn(in scope: TrafficScope) -> UInt64 { scope == .internet ? internetBytesIn : allBytesIn }
+    func bytesOut(in scope: TrafficScope) -> UInt64 { scope == .internet ? internetBytesOut : allBytesOut }
+    func bytes(in scope: TrafficScope) -> UInt64 { saturatingAdd(bytesIn(in: scope), bytesOut(in: scope)) }
 }
 
-/// Per-day internet totals — what the menu-bar title shows ("today").
+extension DayUsage {
+    /// Hand-written (in an extension, so the memberwise init survives) only to
+    /// tolerate the all-traffic fields being absent from older files.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        day = try c.decode(String.self, forKey: .day)
+        internetBytesIn = try c.decode(UInt64.self, forKey: .internetBytesIn)
+        internetBytesOut = try c.decode(UInt64.self, forKey: .internetBytesOut)
+        allBytesIn = try c.decodeIfPresent(UInt64.self, forKey: .allBytesIn) ?? 0
+        allBytesOut = try c.decodeIfPresent(UInt64.self, forKey: .allBytesOut) ?? 0
+    }
+}
+
+/// Per-day totals — what the menu-bar title shows ("today"): internet, or all
+/// traffic when the "Show All Traffic" setting is on.
 ///
-/// Fed once per tick with `ProcessTracker.lastTickInternetBytes`, i.e. every
-/// process's internet traffic, hidden apps included: this is the machine's
-/// real internet usage, not a view of the list. Rolls over at local midnight
+/// Fed once per tick with `ProcessTracker.lastTickInternetBytes` and
+/// `lastTickAllBytes`, i.e. every process's traffic, hidden apps included:
+/// this is the machine's real usage, not a view of the list. Rolls over at local midnight
 /// on the first tick of the new day.
 ///
 /// Main-thread confined (ingest runs from the snapshot callback on main). The
@@ -73,13 +96,18 @@ final class DailyUsageStore {
 
     // MARK: - Ingest
 
-    /// Add one tick's internet bytes. Rolls `today` into `history` first if the
-    /// local date changed since the last tick.
-    func ingest(internetIn: UInt64, internetOut: UInt64, now: Date = Date()) {
+    /// Add one tick's bytes. Rolls `today` into `history` first if the local
+    /// date changed since the last tick. All traffic is clamped to at least
+    /// the internet bytes, so it can never read lower.
+    func ingest(internetIn: UInt64, internetOut: UInt64,
+                allIn: UInt64, allOut: UInt64, now: Date = Date()) {
         rollOverIfNeeded(now: now)
-        guard internetIn > 0 || internetOut > 0 else { return }
+        let allIn = max(allIn, internetIn), allOut = max(allOut, internetOut)
+        guard allIn > 0 || allOut > 0 else { return }
         today.internetBytesIn = saturatingAdd(today.internetBytesIn, internetIn)
         today.internetBytesOut = saturatingAdd(today.internetBytesOut, internetOut)
+        today.allBytesIn = saturatingAdd(today.allBytesIn, allIn)
+        today.allBytesOut = saturatingAdd(today.allBytesOut, allOut)
         dirty = true
     }
 
@@ -94,7 +122,7 @@ final class DailyUsageStore {
     private func rollOverIfNeeded(now: Date) {
         let key = Self.dayKey(for: now, calendar: calendar)
         guard key != today.day else { return }
-        if today.internetBytes > 0 { history.append(today) }
+        if today.allBytes > 0 || today.internetBytes > 0 { history.append(today) }
         if history.count > retainedDays { history.removeFirst(history.count - retainedDays) }
         today = DayUsage(day: key, internetBytesIn: 0, internetBytesOut: 0)
         dirty = true
@@ -130,7 +158,8 @@ final class DailyUsageStore {
     }
 
     private func encoded() -> Data? {
-        let days = history + (today.internetBytes > 0 || !history.isEmpty ? [today] : [])
+        let hasToday = today.allBytes > 0 || today.internetBytes > 0
+        let days = history + (hasToday || !history.isEmpty ? [today] : [])
         return try? JSONEncoder().encode(PersistedWrapper(schema: Self.currentSchema, days: days))
     }
 

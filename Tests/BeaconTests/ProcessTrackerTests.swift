@@ -6,6 +6,24 @@ final class ProcessTrackerTests: XCTestCase {
     ///   - first snapshot establishes baseline (no speed yet)
     ///   - second snapshot computes speed from delta
     ///   - cumulative session bytes accumulate
+    func test_aggregationKey_splitsWebKitHelpersByHost() {
+        let safari = ProcessTracker.aggregationKey(bundleIdentifier: "com.apple.WebKit.Networking",
+                                                   displayName: "Safari Networking")
+        let passwords = ProcessTracker.aggregationKey(bundleIdentifier: "com.apple.WebKit.Networking",
+                                                      displayName: "PasswordsMenuBarExtra Networking")
+        XCTAssertNotEqual(safari, passwords)
+        // The same host's helpers still collapse to one row.
+        XCTAssertEqual(safari, ProcessTracker.aggregationKey(bundleIdentifier: "com.apple.WebKit.Networking",
+                                                             displayName: "Safari Networking"))
+    }
+
+    func test_aggregationKey_regularAppsGroupByBundleId() {
+        XCTAssertEqual(ProcessTracker.aggregationKey(bundleIdentifier: "com.google.Chrome",
+                                                     displayName: "Google Chrome Helper"),
+                       "com.google.Chrome")
+        XCTAssertEqual(ProcessTracker.aggregationKey(bundleIdentifier: nil, displayName: "curl"), "curl")
+    }
+
     func test_singlePid_deltaProducesSpeed() {
         let tracker = ProcessTracker()
         let t0 = Date()

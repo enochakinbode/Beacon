@@ -27,8 +27,55 @@ struct LifetimeUsage: Codable, Identifiable, Equatable {
     /// launch of a build that tracks it (see `init(from:)`).
     var internetBytesIn: UInt64 = 0
     var internetBytesOut: UInt64 = 0
+    /// Bytes moved on the local calendar day `todayKey` (`yyyy-MM-dd`) — what
+    /// the popover list shows. Counters that belong to an earlier day read as
+    /// zero (see `todayBytes(in:day:)`) and are reset on the next ingest, so the
+    /// list starts empty at local midnight. Rows saved by older builds decode
+    /// with no day.
+    var todayKey: String?
+    var todayBytesIn: UInt64 = 0
+    var todayBytesOut: UInt64 = 0
+    var todayInternetBytesIn: UInt64 = 0
+    var todayInternetBytesOut: UInt64 = 0
 
     var totalBytes: UInt64 { saturatingAdd(totalBytesIn, totalBytesOut) }
+
+    /// Local-calendar day key for `date`, matching `DailyUsageStore`.
+    static func dayKey(for date: Date = Date()) -> String {
+        DailyUsageStore.dayKey(for: date, calendar: .current)
+    }
+
+    /// Bytes moved on `day` in `scope`; zero if the counters are from another day.
+    func todayBytes(in scope: TrafficScope, day: String) -> UInt64 {
+        saturatingAdd(todayBytesIn(in: scope, day: day), todayBytesOut(in: scope, day: day))
+    }
+
+    func todayBytesIn(in scope: TrafficScope, day: String) -> UInt64 {
+        guard todayKey == day else { return 0 }
+        return scope == .internet ? todayInternetBytesIn : todayBytesIn
+    }
+
+    func todayBytesOut(in scope: TrafficScope, day: String) -> UInt64 {
+        guard todayKey == day else { return 0 }
+        return scope == .internet ? todayInternetBytesOut : todayBytesOut
+    }
+
+    /// Bank one tick's deltas into the day counters, first resetting them if
+    /// they belong to a day other than `day`.
+    mutating func addToday(bytesIn: UInt64, bytesOut: UInt64,
+                           internetIn: UInt64, internetOut: UInt64, day: String) {
+        if todayKey != day {
+            todayKey = day
+            todayBytesIn = 0
+            todayBytesOut = 0
+            todayInternetBytesIn = 0
+            todayInternetBytesOut = 0
+        }
+        todayBytesIn = saturatingAdd(todayBytesIn, bytesIn)
+        todayBytesOut = saturatingAdd(todayBytesOut, bytesOut)
+        todayInternetBytesIn = saturatingAdd(todayInternetBytesIn, internetIn)
+        todayInternetBytesOut = saturatingAdd(todayInternetBytesOut, internetOut)
+    }
 
     func bytesIn(in scope: TrafficScope) -> UInt64 {
         scope == .internet ? internetBytesIn : totalBytesIn
@@ -59,13 +106,19 @@ extension LifetimeUsage {
         lastSeen = try c.decode(Date.self, forKey: .lastSeen)
         internetBytesIn = try c.decodeIfPresent(UInt64.self, forKey: .internetBytesIn) ?? 0
         internetBytesOut = try c.decodeIfPresent(UInt64.self, forKey: .internetBytesOut) ?? 0
+        todayKey = try c.decodeIfPresent(String.self, forKey: .todayKey)
+        todayBytesIn = try c.decodeIfPresent(UInt64.self, forKey: .todayBytesIn) ?? 0
+        todayBytesOut = try c.decodeIfPresent(UInt64.self, forKey: .todayBytesOut) ?? 0
+        todayInternetBytesIn = try c.decodeIfPresent(UInt64.self, forKey: .todayInternetBytesIn) ?? 0
+        todayInternetBytesOut = try c.decodeIfPresent(UInt64.self, forKey: .todayInternetBytesOut) ?? 0
     }
 }
 
 /// Cross-session cumulative store. The live ProcessTracker only knows about
 /// bytes observed during the current run; this layer adds each snapshot's
 /// per-app delta into a persisted lifetime counter so the popover can show
-/// "all-time" data across launches.
+/// "all-time" data across launches. Each row also carries today's counters
+/// (reset at local midnight), which is what the popover list shows.
 ///
 /// Threading model (v1.4.3 rewrite):
 /// * All mutable state lives on the serial `queue`. The only thing on the
@@ -170,6 +223,7 @@ final class LifetimeUsageStore: ObservableObject {
     /// updated when done.
     func ingest(_ apps: [AppNetworkUsage]) {
         let now = Date()
+        let day = LifetimeUsage.dayKey(for: now)
         queue.async { [self] in
             var changed = false
             for app in apps {
@@ -210,9 +264,11 @@ final class LifetimeUsageStore: ObservableObject {
                     existing.displayName = app.displayName
                     existing.bundleIdentifier = app.bundleIdentifier ?? existing.bundleIdentifier
                     existing.bundlePath = app.bundlePath ?? existing.bundlePath
+                    existing.addToday(bytesIn: dIn, bytesOut: dOut,
+                                      internetIn: dNetIn, internetOut: dNetOut, day: day)
                     queueEntries[app.id] = existing
                 } else {
-                    queueEntries[app.id] = LifetimeUsage(
+                    var entry = LifetimeUsage(
                         id: app.id,
                         displayName: app.displayName,
                         bundleIdentifier: app.bundleIdentifier,
@@ -224,6 +280,9 @@ final class LifetimeUsageStore: ObservableObject {
                         internetBytesIn: dNetIn,
                         internetBytesOut: dNetOut
                     )
+                    entry.addToday(bytesIn: dIn, bytesOut: dOut,
+                                   internetIn: dNetIn, internetOut: dNetOut, day: day)
+                    queueEntries[app.id] = entry
                 }
                 changed = true
             }

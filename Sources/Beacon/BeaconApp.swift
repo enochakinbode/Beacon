@@ -3,6 +3,7 @@ import AppKit
 import os.log
 import Darwin
 import Carbon.HIToolbox
+import Combine
 
 /// Pure AppKit entry point — NO SwiftUI `App`/`Scene`.
 ///
@@ -50,6 +51,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// auto-dismiss never fires. The monitor catches clicks outside the popover
     /// window and closes it manually.
     private var globalClickMonitor: Any?
+    /// Repaints the menu-bar total when the "Show All Traffic" setting flips.
+    private var scopeObserver: AnyCancellable?
     private var localClickMonitor: Any?
 
     /// The popover's hosting window, captured immediately after `popover.show(...)`
@@ -150,6 +153,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // so this closure runs on main.
         viewModel?.onDailyUsageUpdate = { [weak self] today in
             self?.updateMenuBarTitle(with: today)
+        }
+        // Repaint at once when "Show All Traffic" flips, not on the next tick.
+        // objectWillChange fires before the value lands, hence the async hop.
+        scopeObserver = TrafficScopeSetting.shared.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateMenuBarTitle() }
         }
         viewModel?.startMonitoring()
 
@@ -490,15 +498,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Space on each side of the menu-bar text.
     private static let menuBarHorizontalPadding: CGFloat = 1
 
-    /// Update the status-item title with today's internet total (download +
-    /// upload, every process, local-network traffic excluded). Driven by the
+    /// Update the status-item title with today's total (download + upload,
+    /// every process) in the current scope: internet only by default, all
+    /// traffic when "Show All Traffic" is on — matching the popover. Driven by the
     /// view-model's always-on `onDailyUsageUpdate` feed so the menu bar keeps
     /// ticking independently of UI visibility. Text only — no icon. Uses `FormatUtility.formatBytes`,
     /// the same unit vocabulary as the popover rows. Only touches the button
     /// when the text actually changes — most ticks it doesn't.
     private func updateMenuBarTitle(with today: DayUsage) {
         guard let button = statusItem?.button else { return }
-        let title = FormatUtility.formatBytes(today.internetBytes)
+        let scope = TrafficScopeSetting.shared.scope
+        let title = FormatUtility.formatBytes(today.bytes(in: scope))
         if button.title != title {
             // Attributed so the text can sit slightly below the button's
             // default vertical center (negative baseline offset = lower).
@@ -511,7 +521,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let textWidth = ceil(button.attributedTitle.size().width)
             statusItem?.length = textWidth + 2 * Self.menuBarHorizontalPadding
         }
-        let tip = "Internet today: ↓ \(FormatUtility.formatBytes(today.internetBytesIn))  ↑ \(FormatUtility.formatBytes(today.internetBytesOut))"
+        let tip = "\(scope == .internet ? "Internet" : "All traffic") today: ↓ \(FormatUtility.formatBytes(today.bytesIn(in: scope)))  ↑ \(FormatUtility.formatBytes(today.bytesOut(in: scope)))"
         if button.toolTip != tip { button.toolTip = tip }
     }
 

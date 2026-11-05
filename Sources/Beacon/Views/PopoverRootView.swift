@@ -159,7 +159,6 @@ struct PopoverRootView: View {
                 }
             }
             Spacer()
-            ScopeMenuButton(scope: viewModel.scope) { viewModel.scope = $0 }
             activeCountBadge
             HeaderMenuButton(onQuit: onQuit, onResetAllTime: onResetAllTime)
         }
@@ -270,7 +269,8 @@ struct PopoverRootView: View {
         // this, every row paid a `queue.sync` per render.
         let active = viewModel.activeAppIDs
         let liveById = LatestSnapshotStore.shared.allUsagesById()
-        let rows = computeDisplayRows(active: active)
+        let day = LifetimeUsage.dayKey()
+        let rows = computeDisplayRows(active: active, day: day)
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if rows.isEmpty {
@@ -279,11 +279,11 @@ struct PopoverRootView: View {
                             ? "No apps are actively using the internet"
                             : "No apps are actively using the network")
                         : (viewModel.scope == .internet
-                            ? "No internet activity recorded yet"
-                            : "No network activity recorded yet"))
+                            ? "No internet activity recorded today"
+                            : "No network activity recorded today"))
                 } else {
                     ForEach(rows) { entry in
-                        rowView(for: entry, active: active, liveById: liveById, matchChip: nil)
+                        rowView(for: entry, day: day, active: active, liveById: liveById, matchChip: nil)
                     }
                 }
             }
@@ -294,12 +294,14 @@ struct PopoverRootView: View {
     /// layout as the main list (with an optional match-type chip overlay).
     @ViewBuilder
     private func rowView(for entry: LifetimeUsage,
+                          day: String,
                           active: Set<String>,
                           liveById: [String: AppNetworkUsage],
                           matchChip: MatchChip?) -> some View {
         LifetimeRowView(
             entry: entry,
             scope: viewModel.scope,
+            todayBytes: entry.todayBytes(in: viewModel.scope, day: day),
             isActive: active.contains(entry.id),
             live: liveById[entry.id],
             isIgnored: ignored.isIgnored(entry.id),
@@ -365,16 +367,17 @@ struct PopoverRootView: View {
         alert.runModal()
     }
 
-    /// One-pass build: filter ignored, drop zero-byte rows, optional
-    /// active-only filter, sort by bytes desc — all measured in the current
-    /// scope. Zero-byte filter hides apps that haven't transmitted any data
-    /// yet (in Internet scope: apps whose traffic is all local) — they're
-    /// noise in the list.
-    private func computeDisplayRows(active: Set<String>) -> [LifetimeUsage] {
+    /// One-pass build: filter ignored, drop rows with no bytes today, optional
+    /// active-only filter, sort by today's bytes desc — all measured in the
+    /// current scope. The list is "today" (local calendar day, reset at
+    /// midnight): an app that last moved data on an earlier day has zero bytes
+    /// for `day` and drops out (in Internet scope, so does an app whose traffic
+    /// today was all local).
+    private func computeDisplayRows(active: Set<String>, day: String) -> [LifetimeUsage] {
         let ignoredIds = IgnoreListManager.shared.ignoredIds
         let scope = viewModel.scope
         let filtered = lifetime.entries.values.filter { entry in
-            if entry.totalBytes(in: scope) == 0 { return false }
+            if entry.todayBytes(in: scope, day: day) == 0 { return false }
             if ignoredIds.contains(entry.id) { return false }
             if filterActiveOnly && !active.contains(entry.id) { return false }
             return true
@@ -384,7 +387,7 @@ struct PopoverRootView: View {
         // between ticks), so without a total order two apps with identical totals
         // would swap positions tick-to-tick — rows jittering under the cursor.
         return filtered.sorted {
-            let a = $0.totalBytes(in: scope), b = $1.totalBytes(in: scope)
+            let a = $0.todayBytes(in: scope, day: day), b = $1.todayBytes(in: scope, day: day)
             return a != b ? a > b : $0.id < $1.id
         }
     }
@@ -433,6 +436,7 @@ struct PopoverRootView: View {
     }
 
     private struct SearchResultsModel {
+        var day: String = LifetimeUsage.dayKey()
         var apps: [LifetimeUsage] = []
         /// Each: app + matched PID strings (joined "1234, 5678" if multiple).
         var pids: [(LifetimeUsage, String)] = []
@@ -454,7 +458,7 @@ struct PopoverRootView: View {
                                   count: model.apps.count,
                                   content: {
                                       ForEach(model.apps) { entry in
-                                          rowView(for: entry, active: active, liveById: liveById,
+                                          rowView(for: entry, day: model.day, active: active, liveById: liveById,
                                                   matchChip: MatchChip(section: .apps, label: "name"))
                                       }
                                   })
@@ -462,7 +466,7 @@ struct PopoverRootView: View {
                                   count: model.pids.count,
                                   content: {
                                       ForEach(model.pids, id: \.0.id) { pair in
-                                          rowView(for: pair.0, active: active, liveById: liveById,
+                                          rowView(for: pair.0, day: model.day, active: active, liveById: liveById,
                                                   matchChip: MatchChip(section: .pids, label: "PID \(pair.1)"))
                                       }
                                   })
@@ -470,7 +474,7 @@ struct PopoverRootView: View {
                                   count: model.ports.count,
                                   content: {
                                       ForEach(model.ports, id: \.0.id) { pair in
-                                          rowView(for: pair.0, active: active, liveById: liveById,
+                                          rowView(for: pair.0, day: model.day, active: active, liveById: liveById,
                                                   matchChip: MatchChip(section: .ports, label: pair.1))
                                       }
                                   })
@@ -478,7 +482,7 @@ struct PopoverRootView: View {
                                   count: model.services.count,
                                   content: {
                                       ForEach(model.services, id: \.0.id) { pair in
-                                          rowView(for: pair.0, active: active, liveById: liveById,
+                                          rowView(for: pair.0, day: model.day, active: active, liveById: liveById,
                                                   matchChip: MatchChip(section: .services, label: pair.1))
                                       }
                                   })
@@ -534,15 +538,15 @@ struct PopoverRootView: View {
         let lower = q.lowercased()
         let numericPort = UInt16(q)
         let numericPid = Int32(q)
-        // Iterate over the full lifetime set (the same dataset the normal
-        // list draws from), but DO NOT apply the active-only filter — the
-        // user is searching across history, not the currently-active view.
+        // Search today's rows (the same dataset the normal list draws from),
+        // but DO NOT apply the active-only filter.
         let ignoredIds = IgnoreListManager.shared.ignoredIds
         let scope = viewModel.scope
+        let day = model.day
         let sortedEntries = lifetime.entries.values
-            .filter { $0.totalBytes(in: scope) > 0 && !ignoredIds.contains($0.id) }
+            .filter { $0.todayBytes(in: scope, day: day) > 0 && !ignoredIds.contains($0.id) }
             .sorted {
-                let a = $0.totalBytes(in: scope), b = $1.totalBytes(in: scope)
+                let a = $0.todayBytes(in: scope, day: day), b = $1.todayBytes(in: scope, day: day)
                 return a != b ? a > b : $0.id < $1.id
             }
 
@@ -704,6 +708,8 @@ struct LifetimeRowView: View {
     let entry: LifetimeUsage
     /// Which byte counters / speeds the right-hand block shows.
     let scope: TrafficScope
+    /// Bytes this app moved today in `scope` — the row's headline total.
+    let todayBytes: UInt64
     let isActive: Bool
     /// Live snapshot looked up ONCE in the parent and passed down. Lets the
     /// parent batch all rows' lookups into a single queue.sync.
@@ -765,7 +771,7 @@ struct LifetimeRowView: View {
             // RIGHT block: total + live speed. The ↓/↑ split of the total and
             // the code-signature badge live in the chart panel a click opens.
             VStack(alignment: .trailing, spacing: 2) {
-                Text(FormatUtility.formatBytes(entry.totalBytes(in: scope)))
+                Text(FormatUtility.formatBytes(todayBytes))
                     .font(.system(size: 12, weight: .semibold))
 
                 currentSpeedLine(live: live)
@@ -821,12 +827,10 @@ struct LifetimeRowView: View {
     }
 
     private func openGraph() {
-        let initial: GraphTimeRange = (live?.isActive(in: scope) ?? false) ? .live : .oneDay
         GraphPanelController.shared.show(
             appId: entry.id,
             displayName: entry.displayName,
-            nearRowFrame: rowFrame,
-            initialRange: initial
+            nearRowFrame: rowFrame
         )
     }
 
@@ -925,48 +929,6 @@ struct LifetimeRowView: View {
 // MARK: - Scope Menu Button
 
 /// Internet / All Traffic dropdown in the header, beside the active count.
-/// Scopes the list, the search results, the header speeds and the active
-/// badge. Internet (the default) drops loopback, LAN, AirDrop and multicast
-/// traffic — see `TrafficClassifier`. Takes a plain value + callback rather
-/// than observing the view model, and its menu items are static, so the
-/// per-tick header re-render doesn't disturb an open menu (same reasoning as
-/// `HeaderMenuButton`).
-struct ScopeMenuButton: View {
-    let scope: TrafficScope
-    let onSelect: (TrafficScope) -> Void
-
-    var body: some View {
-        Menu {
-            ForEach(TrafficScope.allCases) { option in
-                Button {
-                    onSelect(option)
-                } label: {
-                    if option == scope {
-                        Label(option.label, systemImage: "checkmark")
-                    } else {
-                        Text(option.label)
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 3) {
-                Text(scope.label)
-                    .font(.system(size: 12, weight: .medium))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
-            }
-            .foregroundColor(.primary)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.15)))
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Internet excludes local traffic: this Mac, your LAN, AirDrop and other nearby devices")
-    }
-}
-
 // MARK: - Header Menu Button
 
 /// Gear button in the header. Only observes IgnoreListManager so the
@@ -974,6 +936,9 @@ struct ScopeMenuButton: View {
 struct HeaderMenuButton: View {
     @ObservedObject private var ignored = IgnoreListManager.shared
     @ObservedObject private var graphPanels = GraphPanelController.shared
+    /// Changes only when the user flips the toggle, so observing it doesn't
+    /// add per-tick re-renders.
+    @ObservedObject private var trafficScope = TrafficScopeSetting.shared
     let onQuit: () -> Void
     let onResetAllTime: () -> Void
 
@@ -999,6 +964,14 @@ struct HeaderMenuButton: View {
                 }
                 Divider()
             }
+            // Off (the default) = internet only. On adds loopback, LAN,
+            // AirDrop and other nearby-device traffic to the list, header
+            // speeds and charts. The menu-bar total stays internet-only.
+            Toggle("Show All Traffic", isOn: Binding(
+                get: { trafficScope.scope == .all },
+                set: { trafficScope.scope = $0 ? .all : .internet }
+            ))
+            Divider()
             Button("Reset All-Time Data…", action: onResetAllTime)
             Divider()
             Button("Quit Beacon", action: onQuit)
@@ -1012,9 +985,14 @@ struct HeaderMenuButton: View {
             }
             .frame(width: 26, height: 22)
         }
-        .menuStyle(.borderlessButton)
+        // `.button` + `.plain` lays the label out as-is. `.borderlessButton`
+        // wraps it in an NSPopUpButton with asymmetric bezel insets, which
+        // (with a fixed frame) left the gear short of the header's trailing
+        // padding.
+        .menuStyle(.button)
+        .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .frame(width: 28)
+        .fixedSize()
     }
 }
 

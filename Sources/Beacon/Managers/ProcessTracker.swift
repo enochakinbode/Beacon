@@ -250,6 +250,10 @@ final class ProcessTracker {
     /// apps included). Feeds the daily internet total in the menu bar — read it
     /// right after `ingest`.
     private(set) var lastTickInternetBytes: (bytesIn: UInt64, bytesOut: UInt64) = (0, 0)
+    /// All bytes (internet + local) moved this tick across every process.
+    /// Feeds the daily all-traffic total, shown in the menu bar when the
+    /// "Show All Traffic" setting is on.
+    private(set) var lastTickAllBytes: (bytesIn: UInt64, bytesOut: UInt64) = (0, 0)
 
     /// Split each PID's tick delta into internet and local. The process row is
     /// the authoritative byte count (it includes sockets that closed mid-tick),
@@ -259,7 +263,11 @@ final class ProcessTracker {
                                     localDeltas: [Int32: (bytesIn: UInt64, bytesOut: UInt64)]) {
         var tickIn: UInt64 = 0
         var tickOut: UInt64 = 0
+        var allIn: UInt64 = 0
+        var allOut: UInt64 = 0
         for (pid, d) in tickDeltas {
+            allIn  = allIn  &+ d.bytesIn
+            allOut = allOut &+ d.bytesOut
             guard var state = pidStates[pid] else { continue }
             let local = localDeltas[pid] ?? (0, 0)
             let netIn  = d.bytesIn  - min(local.bytesIn,  d.bytesIn)
@@ -274,6 +282,7 @@ final class ProcessTracker {
             tickOut = tickOut &+ netOut
         }
         lastTickInternetBytes = (tickIn, tickOut)
+        lastTickAllBytes = (allIn, allOut)
     }
 
     /// Same delta-tracking pattern as `pidStates` but per-flow. Cumulative
@@ -453,11 +462,28 @@ final class ProcessTracker {
         .sorted { $0.totalBytes > $1.totalBytes }
     }
 
+    /// Row id for a process: its bundle id, so multi-process apps collapse to
+    /// one row — except WebKit's per-host XPC helpers. Every app that shows web
+    /// content (Safari, Raycast, the Passwords menu-bar extra, …) runs its own
+    /// `com.apple.WebKit.Networking` / `.WebContent` / `.GPU` process sharing
+    /// one bundle id; macOS names each after its host ("Safari Networking").
+    /// Keying on the bundle id alone merged them into one row labelled after
+    /// whichever host was resolved last, so Safari's browsing showed up as
+    /// "PasswordsMenuBarExtra Networking". Pure, so it's unit-tested.
+    static func aggregationKey(bundleIdentifier: String?, displayName: String) -> String {
+        guard let bundleIdentifier else { return displayName }
+        if bundleIdentifier.hasPrefix("com.apple.WebKit.") {
+            return "\(bundleIdentifier)#\(displayName)"
+        }
+        return bundleIdentifier
+    }
+
     private func aggregateByBundle() -> [AppNetworkUsage] {
         var accumulators: [String: BundleAccumulator] = [:]
 
         for (pid, state) in pidStates {
-            let key = state.identity.bundleIdentifier ?? state.identity.displayName
+            let key = Self.aggregationKey(bundleIdentifier: state.identity.bundleIdentifier,
+                                          displayName: state.identity.displayName)
             let speed = lastSpeedByPid[pid] ?? (download: 0, upload: 0)
             let netSpeed = lastInternetSpeedByPid[pid] ?? (download: 0, upload: 0)
 

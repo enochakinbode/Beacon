@@ -109,30 +109,49 @@ final class DailyUsageStoreTests: XCTestCase {
     func test_accumulatesAndRollsOverAtMidnight() {
         let day1 = Date(timeIntervalSince1970: 1_760_000_000)      // 2025-10-09 08:53 UTC
         let store = DailyUsageStore(storeURL: url, calendar: utc, now: day1, autosave: false)
-        store.ingest(internetIn: 1_000, internetOut: 100, now: day1)
-        store.ingest(internetIn: 500, internetOut: 50, now: day1.addingTimeInterval(60))
+        store.ingest(internetIn: 1_000, internetOut: 100, allIn: 3_000, allOut: 300, now: day1)
+        store.ingest(internetIn: 500, internetOut: 50, allIn: 500, allOut: 50, now: day1.addingTimeInterval(60))
         XCTAssertEqual(store.today.internetBytes, 1_650)
+        XCTAssertEqual(store.today.allBytes, 3_850)
+        XCTAssertEqual(store.today.bytes(in: .all), 3_850)
+        XCTAssertEqual(store.today.bytes(in: .internet), 1_650)
 
         let day2 = day1.addingTimeInterval(24 * 3600)
-        store.ingest(internetIn: 0, internetOut: 0, now: day2)
+        store.ingest(internetIn: 0, internetOut: 0, allIn: 0, allOut: 0, now: day2)
         XCTAssertEqual(store.today.internetBytes, 0, "a new day starts from zero even with no traffic")
+        XCTAssertEqual(store.today.allBytes, 0)
         XCTAssertEqual(store.history.map(\.internetBytes), [1_650])
     }
 
     func test_persistsTodayAcrossRelaunch() {
         let now = Date(timeIntervalSince1970: 1_760_000_000)
         let a = DailyUsageStore(storeURL: url, calendar: utc, now: now, autosave: false)
-        a.ingest(internetIn: 2_000, internetOut: 200, now: now)
+        a.ingest(internetIn: 2_000, internetOut: 200, allIn: 5_000, allOut: 400, now: now)
         a.saveBlocking()
 
         let b = DailyUsageStore(storeURL: url, calendar: utc, now: now.addingTimeInterval(10), autosave: false)
         XCTAssertEqual(b.today.internetBytesIn, 2_000)
         XCTAssertEqual(b.today.internetBytesOut, 200)
+        XCTAssertEqual(b.today.allBytes, 5_400)
 
         let nextDay = DailyUsageStore(storeURL: url, calendar: utc,
                                       now: now.addingTimeInterval(24 * 3600), autosave: false)
         XCTAssertEqual(nextDay.today.internetBytes, 0)
         XCTAssertEqual(nextDay.history.count, 1)
+    }
+
+    func test_allTraffic_neverBelowInternet() {
+        let now = Date(timeIntervalSince1970: 1_760_000_000)
+        let store = DailyUsageStore(storeURL: url, calendar: utc, now: now, autosave: false)
+        store.ingest(internetIn: 800, internetOut: 80, allIn: 100, allOut: 10, now: now)
+        XCTAssertEqual(store.today.allBytes, 880)
+    }
+
+    func test_preAllTrafficDay_decodesWithZeroAll() throws {
+        let json = #"{"day":"2026-10-20","internetBytesIn":10,"internetBytesOut":5}"#
+        let day = try JSONDecoder().decode(DayUsage.self, from: Data(json.utf8))
+        XCTAssertEqual(day.internetBytes, 15)
+        XCTAssertEqual(day.allBytes, 0)
     }
 }
 

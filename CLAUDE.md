@@ -42,7 +42,7 @@ Understanding these three things explains most of the codebase; the rest is UI.
 
 All state lives under `~/Library/Application Support/Beacon/`:
 - `lifetime.json` — cross-session all-time per-app byte totals (`LifetimeUsageStore`, schema-versioned, saved every 30 s and on quit).
-- `speed-history.json` — **tiered** history (`SpeedHistoryStore`): 1 Hz for the last hour (memory only), per-minute for 24 h, per-hour for 30 days (the averaged tiers persisted).
+- `speed-history.json` — per-minute speed averages for the last 24 h (`SpeedHistoryStore`). Beacon is today-only: the app chart always shows today (since local midnight) and nothing older than a day is kept.
 
 `LifetimeUsageStore` and `SpeedHistoryStore` each contain a **one-time migration** that moves the pre-rebrand `~/Library/Application Support/NetworkUsageMonitor/` folder to `Beacon/` on first launch. If you rename the app-support folder again, preserve/extend that shim or you silently orphan every user's accumulated history.
 

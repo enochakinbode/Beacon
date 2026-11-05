@@ -72,6 +72,34 @@ final class LifetimeUsageStoreTests: XCTestCase {
         XCTAssertEqual(roundTrip[id]?.totalBytes, 579)
     }
 
+    // MARK: - today counters (popover list resets at local midnight)
+
+    func test_todayBytes_zeroForAnEarlierDay() {
+        var r = row(in: 500, out: 500, first: Date(), last: Date())
+        r.addToday(bytesIn: 10, bytesOut: 5, internetIn: 4, internetOut: 1, day: "2026-10-20")
+        XCTAssertEqual(r.todayBytes(in: .all, day: "2026-10-20"), 15)
+        XCTAssertEqual(r.todayBytes(in: .internet, day: "2026-10-20"), 5)
+        // Five days later, with no traffic since: not part of today's list.
+        XCTAssertEqual(r.todayBytes(in: .all, day: "2026-10-25"), 0)
+        // All-time totals are untouched.
+        XCTAssertEqual(r.totalBytes, 1000)
+    }
+
+    func test_addToday_resetsOnNewDay() {
+        var r = row(in: 0, out: 0, first: Date(), last: Date())
+        r.addToday(bytesIn: 100, bytesOut: 100, internetIn: 50, internetOut: 50, day: "2026-10-25")
+        r.addToday(bytesIn: 7, bytesOut: 3, internetIn: 2, internetOut: 0, day: "2026-10-26")
+        XCTAssertEqual(r.todayBytes(in: .all, day: "2026-10-26"), 10)
+        XCTAssertEqual(r.todayBytes(in: .internet, day: "2026-10-26"), 2)
+    }
+
+    func test_preTodayRow_decodesWithNoDay() throws {
+        let blob = #"{"id":"a","displayName":"A","totalBytesIn":1,"totalBytesOut":2,"firstSeen":0,"lastSeen":0}"#
+        let r = try JSONDecoder().decode(LifetimeUsage.self, from: Data(blob.utf8))
+        XCTAssertNil(r.todayKey)
+        XCTAssertEqual(r.todayBytes(in: .all, day: LifetimeUsage.dayKey()), 0)
+    }
+
     // MARK: - eviction contract (never delete real all-time data)
 
     private func row(in bIn: UInt64, out bOut: UInt64, first: Date, last: Date) -> LifetimeUsage {

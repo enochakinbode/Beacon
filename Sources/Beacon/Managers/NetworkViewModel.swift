@@ -87,9 +87,11 @@ class NetworkViewModel: ObservableObject {
             )
             self.latestInternetSpeed = internetSpeed
 
-            // Today's internet total: every process, hidden apps included.
+            // Today's totals: every process, hidden apps included.
             let tick = self.processTracker.lastTickInternetBytes
+            let all = self.processTracker.lastTickAllBytes
             DailyUsageStore.shared.ingest(internetIn: tick.bytesIn, internetOut: tick.bytesOut,
+                                          allIn: all.bytesIn, allOut: all.bytesOut,
                                           now: snapshot.timestamp)
             let today = DailyUsageStore.shared.today
             // Always feed the menu bar — it must tick whether or not a window is
